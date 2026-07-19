@@ -8,13 +8,22 @@ mod notify;
 mod token;
 
 #[actix_web::main]
-async fn main() -> std::io::Result<()> {
+async fn main() -> std::process::ExitCode {
     if std::env::args().any(|arg| matches!(arg.as_str(), "-h" | "--help" | "help")) {
         print_help();
-        return Ok(());
+        return std::process::ExitCode::SUCCESS;
     }
 
-    api::serve().await
+    match api::serve().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(err) => {
+            // Print the message itself. Returning the error would hand it to
+            // `Termination`, which renders it via `Debug` — escaping newlines
+            // and burying it in `Custom { .. }`.
+            eprintln!("error: {err}");
+            std::process::ExitCode::FAILURE
+        }
+    }
 }
 
 fn print_help() {

@@ -32,6 +32,14 @@ Override the address with:
 DISCORD_MUTE_API_ADDR=127.0.0.1:3220 cargo run
 ```
 
+Port `0` binds an ephemeral port, for a supervising app that would rather not
+race whatever already holds the default. The chosen address is printed on the
+first line of stdout, before any other output, so a parent process can parse it:
+
+```text
+DISCORD_MUTE_API_LISTENING=127.0.0.1:53538
+```
+
 ## First-Time Setup
 
 Create or open a Discord application at:
@@ -122,7 +130,13 @@ controller is actually connected right now:
 }
 ```
 
-Stop the listener by stopping the server (Ctrl-C).
+Stop the listener:
+
+```bash
+curl -X DELETE http://127.0.0.1:3219/listeners/current
+```
+
+Stopping the server (Ctrl-C) also stops it.
 
 ## Controller Notes
 

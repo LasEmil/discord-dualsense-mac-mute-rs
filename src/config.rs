@@ -13,6 +13,13 @@ pub fn load_config() -> Result<AppConfig> {
     let env_client_id = std::env::var("DISCORD_CLIENT_ID").ok();
     let env_client_secret = std::env::var("DISCORD_CLIENT_SECRET").ok();
 
+    // Surface a broken environment as itself, rather than as a missing file at
+    // a path that only looks wrong once you notice it is relative. Credentials
+    // supplied purely through the environment don't need a directory at all.
+    if env_client_id.is_none() && env_client_secret.is_none() {
+        try_config_dir()?;
+    }
+
     let mut config = if config_path().exists() {
         let contents = fs::read_to_string(config_path())
             .with_context(|| format!("failed to read config at {}", config_path().display()))?;
@@ -25,7 +32,9 @@ pub fn load_config() -> Result<AppConfig> {
         }
     } else {
         bail!(
-            "missing config at {}; run `cargo run -- setup` first",
+            "missing config at {}; save credentials with \
+             `curl -X PUT http://<addr>/config -H 'content-type: application/json' \
+             -d '{{\"clientId\":\"...\",\"clientSecret\":\"...\"}}'`",
             config_path().display()
         );
     };
@@ -41,15 +50,30 @@ pub fn load_config() -> Result<AppConfig> {
     Ok(config)
 }
 
-pub fn config_dir() -> PathBuf {
+/// Resolves the config directory, or explains why it can't be.
+///
+/// Falling back to a relative path when `HOME` is unset produces a config that
+/// silently depends on the working directory — which is how a GUI-spawned
+/// server ends up looking for `./.config/discord-mute-rs/config.json` and
+/// reporting a missing file rather than a missing environment.
+pub fn try_config_dir() -> Result<PathBuf> {
     if let Some(path) = std::env::var_os("XDG_CONFIG_HOME") {
-        return PathBuf::from(path).join("discord-mute-rs");
+        return Ok(PathBuf::from(path).join("discord-mute-rs"));
     }
 
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    home.join(".config").join("discord-mute-rs")
+    match std::env::var_os("HOME") {
+        Some(home) => Ok(PathBuf::from(home).join(".config").join("discord-mute-rs")),
+        None => bail!(
+            "cannot locate the config directory: neither XDG_CONFIG_HOME nor HOME is set. \
+             A process launched without an inherited environment must set one of them."
+        ),
+    }
+}
+
+/// Display-oriented form of [`try_config_dir`], for messages and status output
+/// where erroring would be less useful than saying what we looked for.
+pub fn config_dir() -> PathBuf {
+    try_config_dir().unwrap_or_else(|_| PathBuf::from("<unknown: HOME is not set>"))
 }
 
 pub fn config_path() -> PathBuf {
