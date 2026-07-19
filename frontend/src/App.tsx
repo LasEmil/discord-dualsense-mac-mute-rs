@@ -1,5 +1,5 @@
 import { FormEvent, useEffect, useState } from "react";
-import { api, ConfigStatus, DeviceInfo, ListenerMode } from "./api";
+import { api, ConfigStatus } from "./api";
 import { useLiveStatus } from "./useLiveStatus";
 
 function useAsyncAction() {
@@ -74,29 +74,17 @@ export default function App() {
   const [clientSecret, setClientSecret] = useState("");
   const configAction = useAsyncAction();
 
-  const [devices, setDevices] = useState<DeviceInfo[] | null>(null);
-  const devicesAction = useAsyncAction();
-
   const muteAction = useAsyncAction();
   const listenerAction = useAsyncAction();
 
   useEffect(() => {
     api.getConfig().then(setConfig).catch(() => {});
-    loadDevices();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Flash the light bar signature briefly whenever mute state flips.
   useEffect(() => {
     setPulseKey((k) => k + 1);
   }, [status?.muted]);
-
-  function loadDevices() {
-    devicesAction.run(async () => {
-      const res = await api.devices();
-      setDevices(res.devices);
-    });
-  }
 
   function saveConfig(event: FormEvent) {
     event.preventDefault();
@@ -114,20 +102,15 @@ export default function App() {
     });
   }
 
-  function startListener(mode: ListenerMode) {
+  function startListener() {
     listenerAction.run(async () => {
-      await api.startListener(mode);
-    });
-  }
-
-  function stopListener() {
-    listenerAction.run(async () => {
-      await api.stopListener();
+      await api.startListener();
     });
   }
 
   const listener = status?.listener ?? null;
   const muted = status?.muted ?? null;
+  const controllerConnected = Boolean(status?.controllerConnected);
 
   return (
     <div className="page">
@@ -164,35 +147,33 @@ export default function App() {
           </p>
         </Card>
 
-        <Card eyebrow="Controller" title="Listener mode">
+        <Card eyebrow="Controller" title="Mic-button listener">
           <div className="listener-modes">
             <button
-              className={`mode-button ${listener?.mode === "mute" && listener.running ? "mode-button--active" : ""}`}
-              onClick={() => startListener("mute")}
-              disabled={listenerAction.pending}
+              className={`mode-button ${listener?.running ? "mode-button--active" : ""}`}
+              onClick={startListener}
+              disabled={listenerAction.pending || Boolean(listener?.running)}
             >
-              Mic-button toggle
-            </button>
-            <button
-              className={`mode-button ${listener?.mode === "pushToTalk" && listener.running ? "mode-button--active" : ""}`}
-              onClick={() => startListener("pushToTalk")}
-              disabled={listenerAction.pending}
-            >
-              Push-to-talk
+              {listener?.running ? "Listening" : "Start listening"}
             </button>
           </div>
           <div className="listener-status">
-            <span className={`status-pill ${listener?.running ? "status-pill--on" : ""}`}>
-              {listener?.running ? `running · ${listener.mode}` : "stopped"}
+            <span
+              className={`status-pill ${listener?.running && controllerConnected ? "status-pill--on" : ""}`}
+            >
+              {!listener?.running
+                ? "stopped"
+                : controllerConnected
+                  ? "running · controller connected"
+                  : "running · waiting for controller…"}
             </span>
-            {listener?.running && (
-              <button className="link-button" onClick={stopListener} disabled={listenerAction.pending}>
-                stop
-              </button>
-            )}
           </div>
           {listener?.lastError && <p className="error-text">{listener.lastError}</p>}
           {listenerAction.error && <p className="error-text">{listenerAction.error}</p>}
+          <p className="hint">
+            The listener survives unplugging the controller — reconnect it and it picks
+            up again. Stop the listener by stopping the server (Ctrl-C).
+          </p>
         </Card>
 
         <Card eyebrow="Server" title="Status">
@@ -245,23 +226,6 @@ export default function App() {
             </button>
           </form>
           {configAction.error && <p className="error-text">{configAction.error}</p>}
-        </Card>
-
-        <Card eyebrow="Hardware" title="Sony HID devices">
-          <button className="link-button" onClick={loadDevices} disabled={devicesAction.pending}>
-            refresh
-          </button>
-          {devicesAction.error && <p className="error-text">{devicesAction.error}</p>}
-          {devices && devices.length === 0 && <p className="hint">No devices found.</p>}
-          {devices && devices.length > 0 && (
-            <ul className="device-list">
-              {devices.map((device, i) => (
-                <li key={i} className="mono">
-                  {JSON.stringify(device)}
-                </li>
-              ))}
-            </ul>
-          )}
         </Card>
       </main>
     </div>

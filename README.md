@@ -2,16 +2,17 @@
 
 Local Actix Web API for controlling Discord mute and DualSense mic-button helpers from curl.
 
-The server keeps the original app features:
+Features:
 
 - Save Discord application credentials.
 - Authorize Discord RPC and cache the OAuth token.
 - Toggle Discord mute once.
-- List Sony HID devices.
-- Test the DualSense mic mute LED.
-- Run continuous DualSense mic-button mute toggle mode.
-- Run continuous Push-to-Talk mode using macOS Right Option.
-- Inspect status and stop the server.
+- Run continuous DualSense mic-button mute toggle mode, keeping the
+  controller's mic LED in sync.
+- Survive the controller disconnecting and reconnecting while running.
+- Inspect status, live over a WebSocket.
+
+Stop the mic-button listener by stopping the server (Ctrl-C).
 
 ## Run
 
@@ -85,12 +86,6 @@ Config/token paths:
 curl http://127.0.0.1:3219/config
 ```
 
-List Sony HID devices:
-
-```bash
-curl http://127.0.0.1:3219/devices
-```
-
 Toggle Discord mute once:
 
 ```bash
@@ -109,43 +104,25 @@ Override that path with:
 TOKEN_FILE=/Users/emil.laskowski/Documents/files/token.json cargo run
 ```
 
-Test the DualSense mic LED:
-
-```bash
-curl -X POST http://127.0.0.1:3219/controller/led \
-  -H 'content-type: application/json' \
-  -d '{"muted":true}'
-```
-
 Start continuous mute toggle mode with the documented DualSense mic button:
 
 ```bash
 curl -X POST http://127.0.0.1:3219/listeners/mute
 ```
 
-Start Push-to-Talk mode:
+This succeeds even with no controller attached — the listener waits for one to
+appear, and keeps running across disconnects. `/status` reports whether a
+controller is actually connected right now:
 
-```bash
-curl -X POST http://127.0.0.1:3219/listeners/ptt
+```json
+{
+  "muted": false,
+  "controllerConnected": true,
+  "listener": { "running": true, "lastError": null }
+}
 ```
 
-Check the current listener:
-
-```bash
-curl http://127.0.0.1:3219/listeners/current
-```
-
-Stop the current listener:
-
-```bash
-curl -X DELETE http://127.0.0.1:3219/listeners/current
-```
-
-Stop the server:
-
-```bash
-curl -X POST http://127.0.0.1:3219/quit
-```
+Stop the listener by stopping the server (Ctrl-C).
 
 ## Controller Notes
 
@@ -155,6 +132,18 @@ The documented DualSense mic-button mappings are:
 USB report 0x01: byte 10, mask 0x04
 Bluetooth full report 0x31: byte 11, mask 0x04
 ```
+
+Over Bluetooth the controller boots into a compatibility mode that only sends a
+10-byte report 0x01 — sticks and face buttons, no mic button. The server reads
+feature report 0x05 (calibration) on open, which is the documented side effect
+that makes it start sending the full 78-byte report 0x31 that carries the mic
+button. Without that, the mic button is invisible.
+
+That request is re-issued on every reconnect, because a controller that comes
+back is once again in simple mode. Reconnecting also re-scans the HID device
+list — `hidapi` caches it, so a reconnected controller resolves to a new path —
+and restores the mic LED to the current mute state, which the controller drops
+when it disconnects.
 
 The LED output uses the documented/common DualSense output fields:
 
@@ -177,9 +166,6 @@ If HID reads fail or no controller appears, allow Terminal, iTerm, or your launc
 
 ```text
 System Settings > Privacy & Security > Input Monitoring
-System Settings > Privacy & Security > Accessibility
 ```
 
 Then fully quit and reopen the terminal/app before trying again.
-
-Push-to-Talk mode also needs Accessibility permission because it posts a synthetic Right Option key down/up event.

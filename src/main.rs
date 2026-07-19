@@ -4,7 +4,6 @@ mod config;
 mod controller;
 mod discord_ipc;
 mod discord_mute;
-mod keyboard;
 mod notify;
 mod token;
 
@@ -38,11 +37,9 @@ Useful curl commands:
   curl -X PUT http://127.0.0.1:3219/config \\
     -H 'content-type: application/json' \\
     -d '{{\"clientId\":\"...\",\"clientSecret\":\"...\"}}'
-  curl http://127.0.0.1:3219/devices
   curl -X POST http://127.0.0.1:3219/discord/toggle
   curl -X POST http://127.0.0.1:3219/listeners/mute
-  curl -X POST http://127.0.0.1:3219/listeners/ptt
-  curl -X DELETE http://127.0.0.1:3219/listeners/current
-  curl -X POST http://127.0.0.1:3219/quit"
+
+Stop the mic-button listener by stopping the server (Ctrl-C)."
     );
 }

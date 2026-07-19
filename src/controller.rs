@@ -1,6 +1,5 @@
 use anyhow::{Context, Result, bail};
 use hidapi::{HidApi, HidDevice};
-use serde::Serialize;
 use std::{
     sync::{
         Arc,
@@ -14,56 +13,138 @@ const SONY_VENDOR_ID: u16 = 0x054c;
 /// Reading this feature report is what kicks a Bluetooth DualSense into
 /// sending full 0x31 input reports. See `enable_full_report_mode`.
 const DUALSENSE_CALIBRATION_FEATURE_REPORT: u8 = 0x05;
+/// How long to wait before re-scanning for a controller that isn't there yet.
+const RECONNECT_DELAY: Duration = Duration::from_millis(750);
+/// A connected DualSense streams reports continuously, even sitting idle. Going
+/// this long without one means it is gone even if no read has errored yet —
+/// which covers a Bluetooth link dropping silently rather than reporting a
+/// disconnect.
+const REPORT_STALE_AFTER: Duration = Duration::from_secs(5);
+/// Only repeat the "still waiting for a controller" line every N attempts, so
+/// an unplugged controller doesn't flood the log.
+const WAITING_LOG_EVERY: u32 = 20;
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub struct DeviceInfo {
-    pub vendor_id: u16,
-    pub product_id: u16,
-    pub path: String,
-    pub product: String,
+/// Callbacks the mic-button listener fires as the controller comes and goes.
+pub trait MicButtonHandler {
+    /// The mic button was pressed. Returns the resulting mute state.
+    fn on_press(&mut self) -> Result<bool>;
+
+    /// A controller was (re)connected. Returns the mute state to restore to the
+    /// controller's mic LED, which comes back off after every reconnect.
+    fn on_connected(&mut self) -> Option<bool>;
+
+    /// The controller went away. The listener keeps running and will reconnect.
+    fn on_disconnected(&mut self);
 }
 
-pub fn devices() -> Result<Vec<DeviceInfo>> {
-    let api = HidApi::new().context("failed to initialize hidapi")?;
-    let devices = api
-        .device_list()
-        .filter(|device| device.vendor_id() == SONY_VENDOR_ID)
-        .map(|device| DeviceInfo {
-            vendor_id: device.vendor_id(),
-            product_id: device.product_id(),
-            path: device.path().to_string_lossy().to_string(),
-            product: device.product_string().unwrap_or("(unknown)").to_string(),
-        })
-        .collect();
-
-    Ok(devices)
+/// Why an individual controller session ended.
+enum SessionEnd {
+    /// The controller went away; reconnect.
+    Disconnected,
+    /// The caller asked us to stop.
+    Stopped,
 }
 
+/// Watches the mic button until `stop` is set, surviving any number of
+/// controller disconnect/reconnect cycles.
+///
+/// The outer loop owns (re)connection, the inner session owns one controller.
+/// Nothing here treats a vanished controller as fatal: a disconnect ends the
+/// session and drops us back into the connect loop.
 pub fn listen_mic_button_until(
     stop: Option<Arc<AtomicBool>>,
-    on_press: &mut impl FnMut() -> Result<bool>,
+    handler: &mut impl MicButtonHandler,
 ) -> Result<()> {
-    let api = HidApi::new().context("failed to initialize hidapi")?;
-    let device = open_dualsense(&api)?;
-    let mut was_pressed = false;
-    let mut last_press = Instant::now() - Duration::from_secs(1);
-    let mut report_count = 0_u64;
-    let mut last_report_id = None;
-    let mut output_seq = 0_u8;
+    let mut api = HidApi::new().context("failed to initialize hidapi")?;
 
-    println!("Listening for documented DualSense mic button. Press Ctrl-C to stop.");
+    println!("Listening for documented DualSense mic button.");
     println!("USB reports use byte 10 mask 0x04; Bluetooth full reports use byte 11 mask 0x04.");
+
+    let mut waiting_attempts = 0_u32;
 
     loop {
         if should_stop(&stop) {
             return Ok(());
         }
 
-        let Some((report, len)) = read_report(&device)? else {
-            continue;
+        let device = match open_dualsense(&mut api) {
+            Ok(device) => device,
+            Err(err) => {
+                if waiting_attempts % WAITING_LOG_EVERY == 0 {
+                    println!("Waiting for a DualSense to connect: {err}");
+                }
+                waiting_attempts += 1;
+                sleep_unless_stopped(&stop, RECONNECT_DELAY);
+                continue;
+            }
         };
-        let report = &report[..len];
+        waiting_attempts = 0;
+
+        // The controller's mic LED resets on reconnect, so push the mute state
+        // we believe Discord is in rather than leaving the LED lying.
+        if let Some(muted) = handler.on_connected() {
+            restore_mic_led(&device, &stop, muted);
+        }
+
+        let outcome = run_session(&device, &stop, handler);
+        handler.on_disconnected();
+
+        match outcome {
+            SessionEnd::Stopped => return Ok(()),
+            SessionEnd::Disconnected => {
+                println!("Controller disconnected; waiting for it to come back.");
+                sleep_unless_stopped(&stop, RECONNECT_DELAY);
+            }
+        }
+    }
+}
+
+/// Runs one controller connection until it stops or disappears.
+///
+/// Every piece of state here is per-connection and deliberately local, so a
+/// reconnect starts clean — `output_seq` in particular seeds the Bluetooth LED
+/// report CRC and must not carry across sessions.
+fn run_session(
+    device: &HidDevice,
+    stop: &Option<Arc<AtomicBool>>,
+    handler: &mut impl MicButtonHandler,
+) -> SessionEnd {
+    let mut was_pressed = false;
+    let mut last_press = Instant::now() - Duration::from_secs(1);
+    let mut report_count = 0_u64;
+    let mut last_report_id = None;
+    let mut output_seq = 0_u8;
+    let mut last_report_at = Instant::now();
+
+    loop {
+        if should_stop(stop) {
+            return SessionEnd::Stopped;
+        }
+
+        // A read error here is the normal way macOS reports a disconnect, so it
+        // ends the session instead of killing the listener.
+        let report = match read_report(device) {
+            Ok(Some((report, len))) => {
+                last_report_at = Instant::now();
+                (report, len)
+            }
+            Ok(None) => {
+                if last_report_at.elapsed() > REPORT_STALE_AFTER {
+                    println!(
+                        "No controller reports for {}s; treating the controller as gone.",
+                        REPORT_STALE_AFTER.as_secs()
+                    );
+                    return SessionEnd::Disconnected;
+                }
+                continue;
+            }
+            Err(err) => {
+                println!("Controller read failed: {err}");
+                return SessionEnd::Disconnected;
+            }
+        };
+        let (buffer, len) = report;
+        let report = &buffer[..len];
         report_count += 1;
 
         if last_report_id != Some(report[0]) {
@@ -91,9 +172,15 @@ pub fn listen_mic_button_until(
         let now = Instant::now();
         if mic.pressed && !was_pressed {
             println!("Triggering Discord mute toggle...");
-            let muted = on_press()?;
-            sync_mic_led(&device, report, muted, &mut output_seq);
-            println!("Discord mute toggle finished.");
+            // A failed toggle must not take the listener down with it — the
+            // handler records the error, we log it and keep watching.
+            match handler.on_press() {
+                Ok(muted) => {
+                    sync_mic_led(device, report, muted, &mut output_seq);
+                    println!("Discord mute toggle finished.");
+                }
+                Err(err) => println!("Discord mute toggle failed, staying alive: {err}"),
+            }
             last_press = now;
         } else if mic.pressed
             && was_pressed
@@ -108,58 +195,32 @@ pub fn listen_mic_button_until(
     }
 }
 
-pub fn listen_mic_button_hold_until(
-    stop: Option<Arc<AtomicBool>>,
-    on_change: &mut impl FnMut(bool) -> Result<()>,
-) -> Result<()> {
-    let api = HidApi::new().context("failed to initialize hidapi")?;
-    let device = open_dualsense(&api)?;
-    let mut was_pressed = false;
-    let mut report_count = 0_u64;
-    let mut last_report_id = None;
+/// Pushes `muted` to the mic LED right after a (re)connect, before any input
+/// report has arrived to tell us which transport we're on. Reads one report
+/// first, since the LED output format depends on the input report id.
+fn restore_mic_led(device: &HidDevice, stop: &Option<Arc<AtomicBool>>, muted: bool) {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut output_seq = 0_u8;
 
-    println!("Listening for documented DualSense mic button hold. Press Ctrl-C to stop.");
-    println!("Pressing the mic button sends key down; releasing it sends key up.");
-
-    loop {
-        if should_stop(&stop) {
-            return Ok(());
+    while Instant::now() < deadline {
+        if should_stop(stop) {
+            return;
         }
 
-        let Some((report, len)) = read_report(&device)? else {
-            continue;
-        };
-        let report = &report[..len];
-        report_count += 1;
-
-        if last_report_id != Some(report[0]) {
-            last_report_id = Some(report[0]);
-            println!("Controller report id changed to 0x{:02x}", report[0]);
-        }
-
-        let Some(mic) = mic_button_state(report) else {
-            if report_count % 200 == 0 {
-                warn_unusable_report(report);
+        match read_report(device) {
+            Ok(Some((buffer, len))) if mic_button_state(&buffer[..len]).is_some() => {
+                sync_mic_led(device, &buffer[..len], muted, &mut output_seq);
+                return;
             }
-            continue;
-        };
-
-        if mic.pressed && !was_pressed {
-            println!(
-                "Mic button pressed via {} byte {} value 0x{:02x}",
-                mic.transport, mic.byte, mic.value
-            );
-            on_change(true)?;
-        } else if !mic.pressed && was_pressed {
-            println!(
-                "Mic button released via {} byte {} value 0x{:02x}",
-                mic.transport, mic.byte, mic.value
-            );
-            on_change(false)?;
+            Ok(_) => continue,
+            Err(err) => {
+                println!("Warning: could not restore the mic LED after reconnect: {err}");
+                return;
+            }
         }
-
-        was_pressed = mic.pressed;
     }
+
+    println!("Warning: timed out restoring the mic LED after reconnect.");
 }
 
 fn should_stop(stop: &Option<Arc<AtomicBool>>) -> bool {
@@ -167,25 +228,17 @@ fn should_stop(stop: &Option<Arc<AtomicBool>>) -> bool {
         .is_some_and(|stop| stop.load(Ordering::Relaxed))
 }
 
-pub fn test_mic_led(muted: bool) -> Result<()> {
-    let api = HidApi::new().context("failed to initialize hidapi")?;
-    let device = open_dualsense(&api)?;
-    println!(
-        "Testing controller mic LED {}. This does not touch Discord.",
-        if muted { "on" } else { "off" }
-    );
+/// Sleeps, but wakes early once `stop` is set, so stopping a listener that is
+/// waiting to reconnect doesn't block the joining thread for the full delay.
+fn sleep_unless_stopped(stop: &Option<Arc<AtomicBool>>, duration: Duration) {
+    const SLICE: Duration = Duration::from_millis(100);
+    let deadline = Instant::now() + duration;
 
-    let mut output_seq = 0_u8;
-    loop {
-        let Some((report, len)) = read_report(&device)? else {
-            continue;
-        };
-        let report = &report[..len];
-
-        if mic_button_state(report).is_some() {
-            set_mic_mute_led(&device, report[0], muted, &mut output_seq)?;
-            return Ok(());
+    while Instant::now() < deadline {
+        if should_stop(stop) {
+            return;
         }
+        thread::sleep(SLICE.min(deadline.saturating_duration_since(Instant::now())));
     }
 }
 
@@ -328,7 +381,13 @@ fn mic_button_state(report: &[u8]) -> Option<MicButtonState> {
     }
 }
 
-fn open_dualsense(api: &HidApi) -> Result<HidDevice> {
+fn open_dualsense(api: &mut HidApi) -> Result<HidDevice> {
+    // `HidApi` caches its device list and only rebuilds it here. Without this
+    // refresh, a reconnected controller keeps resolving to the stale path from
+    // before the disconnect and every reopen fails.
+    api.refresh_devices()
+        .context("failed to refresh the HID device list")?;
+
     let devices = api
         .device_list()
         .filter(|device| device.vendor_id() == SONY_VENDOR_ID)

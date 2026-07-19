@@ -1,4 +1,4 @@
-use crate::{config, controller, discord_mute, keyboard, token};
+use crate::{config, controller, discord_mute, token};
 use actix_files::Files;
 use actix_web::{App, HttpRequest, HttpResponse, HttpServer, Responder, web};
 use anyhow::{Result, anyhow};
@@ -27,6 +27,7 @@ pub async fn serve() -> std::io::Result<()> {
         started_at: Instant::now(),
         listener: Mutex::new(None),
         last_muted: Mutex::new(None),
+        controller_connected: AtomicBool::new(false),
         discord: Mutex::new(None),
         events: events_tx,
     });
@@ -55,13 +56,8 @@ pub async fn serve() -> std::io::Result<()> {
             .route("/status", web::get().to(status))
             .route("/config", web::get().to(get_config))
             .route("/config", web::put().to(save_config))
-            .route("/devices", web::get().to(devices))
             .route("/discord/toggle", web::post().to(toggle))
-            .route("/controller/led", web::post().to(set_led))
-            .route("/listeners/current", web::get().to(listener_status))
-            .route("/listeners/current", web::delete().to(stop_listener))
             .route("/listeners/mute", web::post().to(start_mute_listener))
-            .route("/listeners/ptt", web::post().to(start_ptt_listener))
             .route("/ws", web::get().to(ws_index))
             .route("/quit", web::post().to(quit))
             // React build output. Keep this last so it never shadows the
@@ -79,27 +75,23 @@ struct ApiState {
     /// Last known mute state, updated by both the HTTP toggle endpoint and
     /// the DualSense button listener, so the UI reflects reality either way.
     last_muted: Mutex<Option<bool>>,
+    /// Whether the running listener currently holds an open controller. A
+    /// listener can be running while this is false: it waits for a controller
+    /// to appear rather than failing.
+    controller_connected: AtomicBool,
     /// A single, persistent Discord IPC session reused across toggles.
-    /// `toggle_once()` reconnects from scratch every call, which races
-    /// Discord's IPC server tearing down the previous session and can hang
-    /// indefinitely on the second toggle — see `toggle()` below.
+    /// Reconnecting from scratch on every call races Discord's IPC server
+    /// tearing down the previous session, and can hang indefinitely on the
+    /// second toggle — see `toggle()` below.
     discord: Mutex<Option<discord_mute::DiscordMute>>,
     events: broadcast::Sender<String>,
 }
 
 struct ListenerWorker {
-    mode: ListenerMode,
     stop: Arc<AtomicBool>,
     finished: Arc<AtomicBool>,
     last_error: Arc<Mutex<Option<String>>>,
     handle: Option<JoinHandle<()>>,
-}
-
-#[derive(Debug, Clone, Copy, Serialize)]
-#[serde(rename_all = "camelCase")]
-enum ListenerMode {
-    Mute,
-    PushToTalk,
 }
 
 #[derive(Serialize)]
@@ -110,13 +102,13 @@ struct StatusResponse {
     uptime_seconds: u64,
     api: String,
     muted: Option<bool>,
+    controller_connected: bool,
     listener: Option<ListenerStatus>,
 }
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct ListenerStatus {
-    mode: ListenerMode,
     running: bool,
     last_error: Option<String>,
 }
@@ -143,27 +135,10 @@ struct SaveConfigResponse {
     path: String,
 }
 
-#[derive(Deserialize)]
-struct LedRequest {
-    muted: bool,
-}
-
 #[derive(Serialize)]
 struct ToggleResponse {
     ok: bool,
     muted: bool,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct DevicesResponse {
-    ok: bool,
-    devices: Vec<controller::DeviceInfo>,
-}
-
-#[derive(Serialize)]
-struct OkResponse {
-    ok: bool,
 }
 
 #[derive(Serialize)]
@@ -200,14 +175,6 @@ async fn save_config(request: web::Json<SaveConfigRequest>) -> impl Responder {
     }
 }
 
-async fn devices() -> impl Responder {
-    match web::block(controller::devices).await {
-        Ok(Ok(devices)) => HttpResponse::Ok().json(DevicesResponse { ok: true, devices }),
-        Ok(Err(err)) => api_error(err),
-        Err(err) => api_error(anyhow!("device scan worker failed: {err}")),
-    }
-}
-
 async fn toggle(state: web::Data<ApiState>) -> impl Responder {
     let state_for_worker = state.clone();
     let result = web::block(move || -> Result<bool> {
@@ -235,58 +202,13 @@ async fn toggle(state: web::Data<ApiState>) -> impl Responder {
     }
 }
 
-async fn set_led(state: web::Data<ApiState>, request: web::Json<LedRequest>) -> impl Responder {
-    let muted = request.muted;
-    match web::block(move || controller::test_mic_led(muted)).await {
-        Ok(Ok(())) => {
-            set_muted(&state, muted);
-            HttpResponse::Ok().json(OkResponse { ok: true })
-        }
-        Ok(Err(err)) => api_error(err),
-        Err(err) => api_error(anyhow!("LED worker failed: {err}")),
-    }
-}
-
-async fn listener_status(state: web::Data<ApiState>) -> impl Responder {
-    HttpResponse::Ok().json(serde_json::json!({
-        "ok": true,
-        "listener": current_listener_status(&state),
-    }))
-}
-
-async fn stop_listener(state: web::Data<ApiState>) -> impl Responder {
-    match stop_current_listener(&state) {
-        Ok(stopped) => {
-            broadcast_snapshot(&state);
-            HttpResponse::Ok().json(serde_json::json!({
-                "ok": true,
-                "stopped": stopped,
-            }))
-        }
-        Err(err) => api_error(err),
-    }
-}
-
 async fn start_mute_listener(state: web::Data<ApiState>) -> impl Responder {
     let state_for_toggle = state.clone();
-    let result = start_listener(&state, ListenerMode::Mute, move |stop, finished, last_error| {
+    let result = start_listener(&state, move |stop, finished, last_error| {
         run_mute_listener(stop, finished, last_error, state_for_toggle)
     });
 
     match result {
-        Ok(status) => {
-            broadcast_snapshot(&state);
-            HttpResponse::Ok().json(serde_json::json!({
-                "ok": true,
-                "listener": status,
-            }))
-        }
-        Err(err) => api_error(err),
-    }
-}
-
-async fn start_ptt_listener(state: web::Data<ApiState>) -> impl Responder {
-    match start_listener(&state, ListenerMode::PushToTalk, run_push_to_talk_listener) {
         Ok(status) => {
             broadcast_snapshot(&state);
             HttpResponse::Ok().json(serde_json::json!({
@@ -367,7 +289,6 @@ async fn ws_index(
 
 fn start_listener(
     state: &web::Data<ApiState>,
-    mode: ListenerMode,
     run: impl FnOnce(Arc<AtomicBool>, Arc<AtomicBool>, Arc<Mutex<Option<String>>>) + Send + 'static,
 ) -> Result<ListenerStatus> {
     stop_current_listener(state)?;
@@ -377,7 +298,6 @@ fn start_listener(
     let last_error = Arc::new(Mutex::new(None));
 
     let worker = ListenerWorker {
-        mode,
         stop: stop.clone(),
         finished: finished.clone(),
         last_error: last_error.clone(),
@@ -394,6 +314,9 @@ fn start_listener(
 }
 
 fn stop_current_listener(state: &web::Data<ApiState>) -> Result<bool> {
+    // Take the worker out and drop the guard before joining below. The listener
+    // thread broadcasts snapshots on every connect/disconnect, and those read
+    // `state.listener` — holding the lock across `join()` would deadlock.
     let worker = state
         .listener
         .lock()
@@ -409,6 +332,7 @@ fn stop_current_listener(state: &web::Data<ApiState>) -> Result<bool> {
             .join()
             .map_err(|_| anyhow!("listener thread panicked while stopping"))?;
     }
+    state.controller_connected.store(false, Ordering::Relaxed);
 
     Ok(true)
 }
@@ -420,31 +344,66 @@ fn run_mute_listener(
     state: web::Data<ApiState>,
 ) {
     let result = || -> Result<()> {
-        let mut discord = discord_mute::DiscordMute::connect()?;
-        let mut on_press = || {
-            let muted = discord.toggle()?;
-            set_muted(&state, muted);
-            Ok(muted)
+        let mut handler = MuteButtonHandler {
+            discord: discord_mute::DiscordMute::connect()?,
+            state: state.clone(),
+            last_error: last_error.clone(),
         };
-        controller::listen_mic_button_until(Some(stop), &mut on_press)
+        controller::listen_mic_button_until(Some(stop), &mut handler)
     }();
 
+    // The listener no longer dies on a disconnect, so reaching here means it
+    // was stopped or hit something genuinely fatal.
+    state.controller_connected.store(false, Ordering::Relaxed);
     finish_listener(result, finished, last_error);
     broadcast_snapshot(&state);
 }
 
-fn run_push_to_talk_listener(
-    stop: Arc<AtomicBool>,
-    finished: Arc<AtomicBool>,
+/// Bridges the controller listener to Discord and the shared API state.
+struct MuteButtonHandler {
+    discord: discord_mute::DiscordMute,
+    state: web::Data<ApiState>,
     last_error: Arc<Mutex<Option<String>>>,
-) {
-    let result = || -> Result<()> {
-        let mut key = keyboard::RightOptionKey::new();
-        let mut on_change = |pressed| if pressed { key.press() } else { key.release() };
-        controller::listen_mic_button_hold_until(Some(stop), &mut on_change)
-    }();
+}
 
-    finish_listener(result, finished, last_error);
+impl MuteButtonHandler {
+    fn record_error(&self, error: Option<String>) {
+        if let Ok(mut last_error) = self.last_error.lock() {
+            *last_error = error;
+        }
+    }
+}
+
+impl controller::MicButtonHandler for MuteButtonHandler {
+    fn on_press(&mut self) -> Result<bool> {
+        match self.discord.toggle() {
+            Ok(muted) => {
+                // Clear a stale failure so the UI stops showing an error that
+                // has since resolved itself.
+                self.record_error(None);
+                set_muted(&self.state, muted);
+                Ok(muted)
+            }
+            Err(err) => {
+                self.record_error(Some(err.to_string()));
+                broadcast_snapshot(&self.state);
+                Err(err)
+            }
+        }
+    }
+
+    fn on_connected(&mut self) -> Option<bool> {
+        self.state.controller_connected.store(true, Ordering::Relaxed);
+        broadcast_snapshot(&self.state);
+        self.state.last_muted.lock().ok().and_then(|muted| *muted)
+    }
+
+    fn on_disconnected(&mut self) {
+        self.state
+            .controller_connected
+            .store(false, Ordering::Relaxed);
+        broadcast_snapshot(&self.state);
+    }
 }
 
 fn finish_listener(
@@ -482,6 +441,7 @@ fn build_status(state: &web::Data<ApiState>) -> StatusResponse {
         uptime_seconds: state.started_at.elapsed().as_secs(),
         api: api_addr(),
         muted: state.last_muted.lock().ok().and_then(|m| *m),
+        controller_connected: state.controller_connected.load(Ordering::Relaxed),
         listener: current_listener_status(state),
     }
 }
@@ -496,7 +456,6 @@ fn broadcast_snapshot(state: &web::Data<ApiState>) {
 impl ListenerWorker {
     fn status(&self) -> ListenerStatus {
         ListenerStatus {
-            mode: self.mode,
             running: !self.finished.load(Ordering::Relaxed),
             last_error: self.last_error.lock().ok().and_then(|error| error.clone()),
         }

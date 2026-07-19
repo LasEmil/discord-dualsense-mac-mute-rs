@@ -1,7 +1,4 @@
-export type ListenerMode = "mute" | "pushToTalk";
-
 export interface ListenerStatus {
-  mode: ListenerMode;
   running: boolean;
   lastError: string | null;
 }
@@ -12,6 +9,7 @@ export interface StatusSnapshot {
   uptimeSeconds: number;
   api: string;
   muted: boolean | null;
+  controllerConnected: boolean;
   listener: ListenerStatus | null;
 }
 
@@ -20,10 +18,6 @@ export interface ConfigStatus {
   configured: boolean;
   configPath: string;
   tokenPath: string;
-}
-
-export interface DeviceInfo {
-  [key: string]: unknown;
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -49,25 +43,11 @@ export const api = {
       body: JSON.stringify({ clientId, clientSecret }),
     }),
 
-  devices: () => request<{ ok: boolean; devices: DeviceInfo[] }>("/devices"),
-
   toggleMute: () =>
     request<{ ok: boolean; muted: boolean }>("/discord/toggle", { method: "POST" }),
 
-  setLed: (muted: boolean) =>
-    request<{ ok: boolean }>("/controller/led", {
+  startListener: () =>
+    request<{ ok: boolean; listener: ListenerStatus }>("/listeners/mute", {
       method: "POST",
-      body: JSON.stringify({ muted }),
-    }),
-
-  startListener: (mode: ListenerMode) =>
-    request<{ ok: boolean; listener: ListenerStatus }>(
-      mode === "mute" ? "/listeners/mute" : "/listeners/ptt",
-      { method: "POST" },
-    ),
-
-  stopListener: () =>
-    request<{ ok: boolean; stopped: boolean }>("/listeners/current", {
-      method: "DELETE",
     }),
 };

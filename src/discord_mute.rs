@@ -88,7 +88,3 @@ impl DiscordMute {
         Ok(muted)
     }
 }
-
-pub fn toggle_once() -> Result<bool> {
-    DiscordMute::connect()?.toggle()
-}
