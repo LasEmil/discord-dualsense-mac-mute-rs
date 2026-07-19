@@ -7,6 +7,10 @@ MACOS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(dirname "$MACOS_DIR")"
 BUILD_DIR="$MACOS_DIR/build"
 APP="$BUILD_DIR/DiscordMute.app"
+INSTALLED="/Applications/DiscordMute.app"
+
+INSTALL=0
+[ "${1:-}" = "--install" ] && INSTALL=1
 
 echo "==> Building the Rust server"
 cargo build --release --manifest-path "$REPO_DIR/Cargo.toml"
@@ -57,7 +61,25 @@ codesign --verify --deep --strict "$APP"
 
 echo
 echo "Built $APP"
-echo "Open it with:  open '$APP'"
+
+if [ "$INSTALL" -eq 1 ]; then
+  echo "==> Installing to $INSTALLED"
+  # Quit a running copy first: replacing a bundle underneath a live process
+  # leaves it running against files that no longer exist.
+  pkill -x DiscordMute 2>/dev/null || true
+  sleep 2
+  rm -rf "$INSTALLED"
+  cp -R "$APP" "$INSTALLED"
+  echo
+  echo "Installed. Open it with:  open '$INSTALLED'"
+else
+  echo "Open it with:  open '$APP'"
+  echo
+  echo "This lives in a build directory that is deleted on every build, so it is"
+  echo "a poor target for launch at login. Install it properly with:"
+  echo "    ./macos/build-app.sh --install"
+fi
+
 echo
 echo "Note: ad-hoc signatures change on every rebuild, so macOS may ask again"
 echo "for Input Monitoring, and any launch-at-login registration may lapse."
