@@ -1,5 +1,6 @@
 use crate::{config, controller, discord_mute, keyboard, token};
-use actix_web::{App, HttpResponse, HttpServer, Responder, web};
+use actix_files::Files;
+use actix_web::{App, HttpRequest, HttpResponse, HttpServer, Responder, web};
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -10,18 +11,43 @@ use std::{
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
+use tokio::sync::broadcast;
 
 const DEFAULT_API_ADDR: &str = "127.0.0.1:3219";
+const STATIC_DIR: &str = "./static";
+// How often we push a fresh snapshot to connected UIs, in addition to
+// pushing immediately after every mutating request.
+const BROADCAST_TICK: Duration = Duration::from_millis(500);
 
 pub async fn serve() -> std::io::Result<()> {
     let addr = api_addr();
+    let (events_tx, _) = broadcast::channel::<String>(32);
+
     let state = web::Data::new(ApiState {
         started_at: Instant::now(),
         listener: Mutex::new(None),
+        last_muted: Mutex::new(None),
+        discord: Mutex::new(None),
+        events: events_tx,
     });
+
+    // Background ticker: keeps the UI in sync even when state changes
+    // originate outside an HTTP request (e.g. a DualSense button press
+    // flips mute from a background thread).
+    {
+        let state = state.clone();
+        actix_web::rt::spawn(async move {
+            let mut interval = actix_web::rt::time::interval(BROADCAST_TICK);
+            loop {
+                interval.tick().await;
+                broadcast_snapshot(&state);
+            }
+        });
+    }
 
     println!("Discord mute API listening at http://{addr}");
     println!("Try: curl http://{addr}/status");
+    println!("UI:  http://{addr}/");
 
     HttpServer::new(move || {
         App::new()
@@ -36,7 +62,11 @@ pub async fn serve() -> std::io::Result<()> {
             .route("/listeners/current", web::delete().to(stop_listener))
             .route("/listeners/mute", web::post().to(start_mute_listener))
             .route("/listeners/ptt", web::post().to(start_ptt_listener))
+            .route("/ws", web::get().to(ws_index))
             .route("/quit", web::post().to(quit))
+            // React build output. Keep this last so it never shadows the
+            // API routes above; it only matches what nothing else claimed.
+            .service(Files::new("/", STATIC_DIR).index_file("index.html"))
     })
     .bind(addr)?
     .run()
@@ -46,6 +76,15 @@ pub async fn serve() -> std::io::Result<()> {
 struct ApiState {
     started_at: Instant,
     listener: Mutex<Option<ListenerWorker>>,
+    /// Last known mute state, updated by both the HTTP toggle endpoint and
+    /// the DualSense button listener, so the UI reflects reality either way.
+    last_muted: Mutex<Option<bool>>,
+    /// A single, persistent Discord IPC session reused across toggles.
+    /// `toggle_once()` reconnects from scratch every call, which races
+    /// Discord's IPC server tearing down the previous session and can hang
+    /// indefinitely on the second toggle — see `toggle()` below.
+    discord: Mutex<Option<discord_mute::DiscordMute>>,
+    events: broadcast::Sender<String>,
 }
 
 struct ListenerWorker {
@@ -70,10 +109,11 @@ struct StatusResponse {
     pid: u32,
     uptime_seconds: u64,
     api: String,
+    muted: Option<bool>,
     listener: Option<ListenerStatus>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct ListenerStatus {
     mode: ListenerMode,
@@ -133,13 +173,7 @@ struct ErrorResponse {
 }
 
 async fn status(state: web::Data<ApiState>) -> impl Responder {
-    HttpResponse::Ok().json(StatusResponse {
-        ok: true,
-        pid: std::process::id(),
-        uptime_seconds: state.started_at.elapsed().as_secs(),
-        api: api_addr(),
-        listener: current_listener_status(&state),
-    })
+    HttpResponse::Ok().json(build_status(&state))
 }
 
 async fn get_config() -> impl Responder {
@@ -174,18 +208,40 @@ async fn devices() -> impl Responder {
     }
 }
 
-async fn toggle() -> impl Responder {
-    match web::block(discord_mute::toggle_once).await {
-        Ok(Ok(muted)) => HttpResponse::Ok().json(ToggleResponse { ok: true, muted }),
+async fn toggle(state: web::Data<ApiState>) -> impl Responder {
+    let state_for_worker = state.clone();
+    let result = web::block(move || -> Result<bool> {
+        let mut guard = state_for_worker
+            .discord
+            .lock()
+            .map_err(|_| anyhow!("Discord connection lock is poisoned"))?;
+        if guard.is_none() {
+            *guard = Some(discord_mute::DiscordMute::connect()?);
+        }
+        // `toggle()` already retries once with a fresh reconnect internally
+        // if the current session errors out, so this stays resilient
+        // without us tearing the connection down between calls.
+        guard.as_mut().expect("just ensured Some above").toggle()
+    })
+    .await;
+
+    match result {
+        Ok(Ok(muted)) => {
+            set_muted(&state, muted);
+            HttpResponse::Ok().json(ToggleResponse { ok: true, muted })
+        }
         Ok(Err(err)) => api_error(err),
         Err(err) => api_error(anyhow!("Discord toggle worker failed: {err}")),
     }
 }
 
-async fn set_led(request: web::Json<LedRequest>) -> impl Responder {
+async fn set_led(state: web::Data<ApiState>, request: web::Json<LedRequest>) -> impl Responder {
     let muted = request.muted;
     match web::block(move || controller::test_mic_led(muted)).await {
-        Ok(Ok(())) => HttpResponse::Ok().json(OkResponse { ok: true }),
+        Ok(Ok(())) => {
+            set_muted(&state, muted);
+            HttpResponse::Ok().json(OkResponse { ok: true })
+        }
         Ok(Err(err)) => api_error(err),
         Err(err) => api_error(anyhow!("LED worker failed: {err}")),
     }
@@ -200,34 +256,44 @@ async fn listener_status(state: web::Data<ApiState>) -> impl Responder {
 
 async fn stop_listener(state: web::Data<ApiState>) -> impl Responder {
     match stop_current_listener(&state) {
-        Ok(stopped) => HttpResponse::Ok().json(serde_json::json!({
-            "ok": true,
-            "stopped": stopped,
-        })),
+        Ok(stopped) => {
+            broadcast_snapshot(&state);
+            HttpResponse::Ok().json(serde_json::json!({
+                "ok": true,
+                "stopped": stopped,
+            }))
+        }
         Err(err) => api_error(err),
     }
 }
 
 async fn start_mute_listener(state: web::Data<ApiState>) -> impl Responder {
-    match start_listener(
-        &state,
-        ListenerMode::Mute,
-        move |stop, finished, last_error| run_mute_listener(stop, finished, last_error),
-    ) {
-        Ok(status) => HttpResponse::Ok().json(serde_json::json!({
-            "ok": true,
-            "listener": status,
-        })),
+    let state_for_toggle = state.clone();
+    let result = start_listener(&state, ListenerMode::Mute, move |stop, finished, last_error| {
+        run_mute_listener(stop, finished, last_error, state_for_toggle)
+    });
+
+    match result {
+        Ok(status) => {
+            broadcast_snapshot(&state);
+            HttpResponse::Ok().json(serde_json::json!({
+                "ok": true,
+                "listener": status,
+            }))
+        }
         Err(err) => api_error(err),
     }
 }
 
 async fn start_ptt_listener(state: web::Data<ApiState>) -> impl Responder {
     match start_listener(&state, ListenerMode::PushToTalk, run_push_to_talk_listener) {
-        Ok(status) => HttpResponse::Ok().json(serde_json::json!({
-            "ok": true,
-            "listener": status,
-        })),
+        Ok(status) => {
+            broadcast_snapshot(&state);
+            HttpResponse::Ok().json(serde_json::json!({
+                "ok": true,
+                "listener": status,
+            }))
+        }
         Err(err) => api_error(err),
     }
 }
@@ -244,6 +310,59 @@ async fn quit(state: web::Data<ApiState>) -> impl Responder {
         "ok": true,
         "message": "quitting",
     }))
+}
+
+/// Upgrades to a WebSocket and streams status snapshots to the browser as
+/// they happen, so the UI never has to poll.
+async fn ws_index(
+    req: HttpRequest,
+    stream: web::Payload,
+    state: web::Data<ApiState>,
+) -> actix_web::Result<HttpResponse> {
+    let (response, mut session, mut msg_stream) = actix_ws::handle(&req, stream)?;
+    let mut rx = state.events.subscribe();
+
+    // Send an initial snapshot immediately so the UI has something to
+    // render before the first tick or the first mutation.
+    let initial = serde_json::to_string(&build_status(&state)).unwrap_or_default();
+
+    actix_web::rt::spawn(async move {
+        if session.text(initial).await.is_err() {
+            return;
+        }
+
+        loop {
+            tokio::select! {
+                msg = rx.recv() => {
+                    match msg {
+                        Ok(payload) => {
+                            if session.text(payload).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+                frame = futures_util::StreamExt::next(&mut msg_stream) => {
+                    match frame {
+                        Some(Ok(actix_ws::Message::Ping(bytes))) => {
+                            if session.pong(&bytes).await.is_err() {
+                                break;
+                            }
+                        }
+                        Some(Ok(actix_ws::Message::Close(_))) | None => break,
+                        Some(Err(_)) => break,
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        let _ = session.close(None).await;
+    });
+
+    Ok(response)
 }
 
 fn start_listener(
@@ -298,14 +417,20 @@ fn run_mute_listener(
     stop: Arc<AtomicBool>,
     finished: Arc<AtomicBool>,
     last_error: Arc<Mutex<Option<String>>>,
+    state: web::Data<ApiState>,
 ) {
     let result = || -> Result<()> {
         let mut discord = discord_mute::DiscordMute::connect()?;
-        let mut on_press = || discord.toggle();
+        let mut on_press = || {
+            let muted = discord.toggle()?;
+            set_muted(&state, muted);
+            Ok(muted)
+        };
         controller::listen_mic_button_until(Some(stop), &mut on_press)
     }();
 
     finish_listener(result, finished, last_error);
+    broadcast_snapshot(&state);
 }
 
 fn run_push_to_talk_listener(
@@ -341,6 +466,31 @@ fn current_listener_status(state: &web::Data<ApiState>) -> Option<ListenerStatus
         .lock()
         .ok()
         .and_then(|worker| worker.as_ref().map(ListenerWorker::status))
+}
+
+fn set_muted(state: &web::Data<ApiState>, muted: bool) {
+    if let Ok(mut last_muted) = state.last_muted.lock() {
+        *last_muted = Some(muted);
+    }
+    broadcast_snapshot(state);
+}
+
+fn build_status(state: &web::Data<ApiState>) -> StatusResponse {
+    StatusResponse {
+        ok: true,
+        pid: std::process::id(),
+        uptime_seconds: state.started_at.elapsed().as_secs(),
+        api: api_addr(),
+        muted: state.last_muted.lock().ok().and_then(|m| *m),
+        listener: current_listener_status(state),
+    }
+}
+
+fn broadcast_snapshot(state: &web::Data<ApiState>) {
+    if let Ok(payload) = serde_json::to_string(&build_status(state)) {
+        // No receivers is not an error, it just means no UI is open.
+        let _ = state.events.send(payload);
+    }
 }
 
 impl ListenerWorker {

@@ -6,7 +6,7 @@ use std::{
     os::unix::net::UnixStream,
     path::PathBuf,
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 use uuid::Uuid;
 
@@ -215,6 +215,13 @@ fn read_frame(stream: &mut UnixStream) -> Result<(i32, Value)> {
 }
 
 fn read_exact_retry(stream: &mut UnixStream, mut buffer: &mut [u8]) -> Result<()> {
+    // `set_read_timeout` makes `read()` return `WouldBlock` once the timeout
+    // elapses — that's a real timeout, not a "try again right away" signal.
+    // Without tracking a deadline here, every WouldBlock just loops forever,
+    // silently defeating the configured timeout whenever Discord doesn't
+    // respond (e.g. reconnecting before it's torn down the previous session).
+    let deadline = Instant::now() + Duration::from_secs(10);
+
     while !buffer.is_empty() {
         match stream.read(buffer) {
             Ok(0) => bail!("Discord IPC socket closed"),
@@ -225,6 +232,9 @@ fn read_exact_retry(stream: &mut UnixStream, mut buffer: &mut [u8]) -> Result<()
             Err(err)
                 if err.kind() == ErrorKind::WouldBlock || err.kind() == ErrorKind::Interrupted =>
             {
+                if Instant::now() >= deadline {
+                    bail!("timed out waiting for a response from Discord IPC");
+                }
                 thread::sleep(Duration::from_millis(10));
             }
             Err(err) => return Err(err).context("failed to read from Discord IPC socket"),

@@ -11,6 +11,9 @@ use std::{
 };
 
 const SONY_VENDOR_ID: u16 = 0x054c;
+/// Reading this feature report is what kicks a Bluetooth DualSense into
+/// sending full 0x31 input reports. See `enable_full_report_mode`.
+const DUALSENSE_CALIBRATION_FEATURE_REPORT: u8 = 0x05;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -57,9 +60,10 @@ pub fn listen_mic_button_until(
             return Ok(());
         }
 
-        let Some(report) = read_report(&device)? else {
+        let Some((report, len)) = read_report(&device)? else {
             continue;
         };
+        let report = &report[..len];
         report_count += 1;
 
         if last_report_id != Some(report[0]) {
@@ -67,9 +71,9 @@ pub fn listen_mic_button_until(
             println!("Controller report id changed to 0x{:02x}", report[0]);
         }
 
-        let Some(mic) = mic_button_state(&report) else {
+        let Some(mic) = mic_button_state(report) else {
             if report_count % 200 == 0 {
-                println!("Ignoring unsupported report id 0x{:02x}", report[0]);
+                warn_unusable_report(report);
             }
             continue;
         };
@@ -88,7 +92,7 @@ pub fn listen_mic_button_until(
         if mic.pressed && !was_pressed {
             println!("Triggering Discord mute toggle...");
             let muted = on_press()?;
-            sync_mic_led(&device, &report, muted, &mut output_seq);
+            sync_mic_led(&device, report, muted, &mut output_seq);
             println!("Discord mute toggle finished.");
             last_press = now;
         } else if mic.pressed
@@ -122,9 +126,10 @@ pub fn listen_mic_button_hold_until(
             return Ok(());
         }
 
-        let Some(report) = read_report(&device)? else {
+        let Some((report, len)) = read_report(&device)? else {
             continue;
         };
+        let report = &report[..len];
         report_count += 1;
 
         if last_report_id != Some(report[0]) {
@@ -132,9 +137,9 @@ pub fn listen_mic_button_hold_until(
             println!("Controller report id changed to 0x{:02x}", report[0]);
         }
 
-        let Some(mic) = mic_button_state(&report) else {
+        let Some(mic) = mic_button_state(report) else {
             if report_count % 200 == 0 {
-                println!("Ignoring unsupported report id 0x{:02x}", report[0]);
+                warn_unusable_report(report);
             }
             continue;
         };
@@ -172,18 +177,34 @@ pub fn test_mic_led(muted: bool) -> Result<()> {
 
     let mut output_seq = 0_u8;
     loop {
-        let Some(report) = read_report(&device)? else {
+        let Some((report, len)) = read_report(&device)? else {
             continue;
         };
+        let report = &report[..len];
 
-        if mic_button_state(&report).is_some() {
+        if mic_button_state(report).is_some() {
             set_mic_mute_led(&device, report[0], muted, &mut output_seq)?;
             return Ok(());
         }
     }
 }
 
-fn sync_mic_led(device: &HidDevice, input_report: &[u8; 128], muted: bool, output_seq: &mut u8) {
+/// Explains *why* a report is unusable. "Unsupported report id" alone hides
+/// the common Bluetooth case, where the id is one we handle but the report is
+/// too short to contain the button.
+fn warn_unusable_report(report: &[u8]) {
+    match report.first() {
+        Some(id @ (0x01 | 0x31)) => println!(
+            "Report id 0x{id:02x} is only {} bytes — too short to contain the mic button. \
+             The controller is likely stuck in Bluetooth simple mode.",
+            report.len()
+        ),
+        Some(id) => println!("Ignoring unsupported report id 0x{id:02x}"),
+        None => println!("Ignoring empty controller report"),
+    }
+}
+
+fn sync_mic_led(device: &HidDevice, input_report: &[u8], muted: bool, output_seq: &mut u8) {
     match set_mic_mute_led(device, input_report[0], muted, output_seq) {
         Ok(()) => println!(
             "Controller mic LED set to {}.",
@@ -281,9 +302,15 @@ struct MicButtonState {
     transport: &'static str,
 }
 
-fn mic_button_state(report: &[u8; 128]) -> Option<MicButtonState> {
-    match report[0] {
-        0x01 => Some(MicButtonState {
+/// Locates the mic-button bit in a report, or `None` if this report can't
+/// carry it. The length guards are load-bearing rather than defensive: a
+/// Bluetooth controller in simple mode sends report id 0x01 in only 10 bytes,
+/// which collides with the USB 0x01 layout that keeps the bit at byte 10.
+fn mic_button_state(report: &[u8]) -> Option<MicButtonState> {
+    match report.first()? {
+        // USB report 0x01: the common report starts at data[1], so buttons[2]
+        // is byte 10.
+        0x01 if report.len() > 10 => Some(MicButtonState {
             pressed: report[10] & 0x04 != 0,
             byte: 10,
             value: report[10],
@@ -291,7 +318,7 @@ fn mic_button_state(report: &[u8; 128]) -> Option<MicButtonState> {
         }),
         // Bluetooth full report 0x31: Linux's DualSense parser starts the common
         // report at data[2], so buttons[2] is byte 11.
-        0x31 => Some(MicButtonState {
+        0x31 if report.len() > 11 => Some(MicButtonState {
             pressed: report[11] & 0x04 != 0,
             byte: 11,
             value: report[11],
@@ -329,19 +356,49 @@ fn open_dualsense(api: &HidApi) -> Result<HidDevice> {
         device.product_string().unwrap_or("(unknown)")
     );
 
-    device
+    let device = device
         .open_device(api)
-        .context("failed to open controller HID device")
+        .context("failed to open controller HID device")?;
+    enable_full_report_mode(&device);
+
+    Ok(device)
 }
 
-fn read_report(device: &HidDevice) -> Result<Option<[u8; 128]>> {
+/// Switches a Bluetooth DualSense out of simple mode.
+///
+/// Over Bluetooth the controller boots into a compatibility mode that only
+/// sends a 10-byte report 0x01 — sticks and face buttons, no mic button at
+/// all. Reading feature report 0x05 (the calibration blob) is the documented
+/// side effect that makes it start sending the full 78-byte report 0x31,
+/// which is the only report that carries the mic-button bit.
+///
+/// Over USB the controller already sends the full report, and this read is
+/// harmless, so a failure here is logged rather than fatal.
+fn enable_full_report_mode(device: &HidDevice) {
+    let mut feature = [0_u8; 64];
+    feature[0] = DUALSENSE_CALIBRATION_FEATURE_REPORT;
+
+    match device.get_feature_report(&mut feature) {
+        Ok(len) => println!("Requested DualSense full report mode ({len}-byte calibration read)."),
+        Err(err) => println!(
+            "Warning: could not read the DualSense calibration feature report ({err}); \
+             a Bluetooth controller may stay in simple mode and never report the mic button."
+        ),
+    }
+}
+
+/// Reads one HID report, returning the buffer *and* how many bytes actually
+/// arrived. The length matters: a Bluetooth DualSense in simple mode sends a
+/// 10-byte report, and indexing past that silently reads zero padding rather
+/// than failing, which looks exactly like "the button is never pressed".
+fn read_report(device: &HidDevice) -> Result<Option<([u8; 128], usize)>> {
     let mut report = [0_u8; 128];
     match device.read_timeout(&mut report, 250) {
         Ok(0) => {
             thread::sleep(Duration::from_millis(10));
             Ok(None)
         }
-        Ok(_) => Ok(Some(report)),
+        Ok(len) => Ok(Some((report, len))),
         Err(err) => Err(err).context("failed to read controller HID report"),
     }
 }
