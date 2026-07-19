@@ -105,9 +105,18 @@ private struct StatusRows: View {
         VStack(spacing: 8) {
             StatusRow(
                 title: "Controller",
-                detail: model.controllerConnected ? "Connected" : "Waiting",
+                detail: model.controllerDetail,
                 isOn: model.controllerConnected
             )
+
+            if let hint = model.controllerHint {
+                Text(hint)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+
             StatusRow(
                 title: "Listener",
                 detail: model.listenerRunning ? "Running" : "Stopped",

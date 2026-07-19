@@ -15,6 +15,7 @@ struct StatusSnapshot: Decodable, Equatable {
     let api: String
     let muted: Bool?
     let controllerConnected: Bool
+    let controllerError: String?
     let listener: ListenerStatus?
 }
 

@@ -42,6 +42,34 @@ final class AppModel: ObservableObject {
     var listenerError: String? { status?.listener?.lastError }
     var isLive: Bool { client.isConnected }
 
+    /// What the Controller row should say when nothing is attached.
+    ///
+    /// A listener with no controller is usually just an idle DualSense, but it
+    /// looks the same as one we are not permitted to read — so say which.
+    var controllerDetail: String {
+        if controllerConnected { return "Connected" }
+        guard listenerRunning else { return "—" }
+        return isPermissionProblem ? "No access" : "Waiting"
+    }
+
+    /// A hint shown only when waiting is not self-explanatory.
+    var controllerHint: String? {
+        guard listenerRunning, !controllerConnected else { return nil }
+        guard let reason = status?.controllerError else { return nil }
+
+        return isPermissionProblem
+            ? "Grant Input Monitoring to DiscordMute in System Settings › Privacy & Security."
+            : reason
+    }
+
+    /// hidapi reports "no device found" when nothing is attached. Anything else
+    /// means a device was seen but could not be opened, which on macOS is
+    /// almost always the Input Monitoring grant.
+    private var isPermissionProblem: Bool {
+        guard let reason = status?.controllerError?.lowercased() else { return false }
+        return !reason.contains("no sony hid device")
+    }
+
     /// The first thing worth showing when something is wrong, in the order a
     /// failure would actually occur.
     var problem: String? {

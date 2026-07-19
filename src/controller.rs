@@ -35,6 +35,13 @@ pub trait MicButtonHandler {
 
     /// The controller went away. The listener keeps running and will reconnect.
     fn on_disconnected(&mut self);
+
+    /// No controller could be opened, with the reason why.
+    ///
+    /// Worth reporting rather than only logging: "no device found" and "found
+    /// it but could not open it" both leave the listener waiting, and only the
+    /// second one is the user's to fix.
+    fn on_waiting(&mut self, reason: &str);
 }
 
 /// Why an individual controller session ended.
@@ -73,6 +80,7 @@ pub fn listen_mic_button_until(
                 if waiting_attempts % WAITING_LOG_EVERY == 0 {
                     println!("Waiting for a DualSense to connect: {err}");
                 }
+                handler.on_waiting(&err.to_string());
                 waiting_attempts += 1;
                 sleep_unless_stopped(&stop, RECONNECT_DELAY);
                 continue;

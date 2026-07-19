@@ -126,9 +126,14 @@ controller is actually connected right now:
 {
   "muted": false,
   "controllerConnected": true,
+  "controllerError": null,
   "listener": { "running": true, "lastError": null }
 }
 ```
+
+When no controller can be opened, `controllerError` carries the reason. That
+distinguishes a controller that is merely switched off from one the process is
+not permitted to read — both otherwise leave the listener waiting forever.
 
 Stop the listener:
 

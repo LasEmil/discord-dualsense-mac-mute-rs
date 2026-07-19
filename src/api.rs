@@ -47,6 +47,7 @@ pub async fn serve() -> std::io::Result<()> {
         listener: Mutex::new(None),
         last_muted: Mutex::new(None),
         controller_connected: AtomicBool::new(false),
+        controller_error: Mutex::new(None),
         discord: Mutex::new(None),
         events: events_tx,
         server_handle: Mutex::new(None),
@@ -127,6 +128,10 @@ struct ApiState {
     /// listener can be running while this is false: it waits for a controller
     /// to appear rather than failing.
     controller_connected: AtomicBool,
+    /// Why the listener cannot open a controller, when it cannot. Distinguishes
+    /// "nothing is plugged in" from "something is, and we are not allowed to
+    /// read it" — which otherwise look identical from outside.
+    controller_error: Mutex<Option<String>>,
     /// A single, persistent Discord IPC session reused across toggles.
     /// Reconnecting from scratch on every call races Discord's IPC server
     /// tearing down the previous session, and can hang indefinitely on the
@@ -156,6 +161,7 @@ struct StatusResponse {
     api: String,
     muted: Option<bool>,
     controller_connected: bool,
+    controller_error: Option<String>,
     listener: Option<ListenerStatus>,
 }
 
@@ -410,6 +416,7 @@ fn stop_current_listener(state: &web::Data<ApiState>) -> Result<bool> {
             .map_err(|_| anyhow!("listener thread panicked while stopping"))?;
     }
     state.controller_connected.store(false, Ordering::Relaxed);
+    set_controller_error(state, None);
 
     Ok(true)
 }
@@ -432,6 +439,7 @@ fn run_mute_listener(
     // The listener no longer dies on a disconnect, so reaching here means it
     // was stopped or hit something genuinely fatal.
     state.controller_connected.store(false, Ordering::Relaxed);
+    set_controller_error(&state, None);
     finish_listener(result, finished, last_error);
     broadcast_snapshot(&state);
 }
@@ -471,6 +479,7 @@ impl controller::MicButtonHandler for MuteButtonHandler {
 
     fn on_connected(&mut self) -> Option<bool> {
         self.state.controller_connected.store(true, Ordering::Relaxed);
+        set_controller_error(&self.state, None);
         broadcast_snapshot(&self.state);
         self.state.last_muted.lock().ok().and_then(|muted| *muted)
     }
@@ -480,6 +489,28 @@ impl controller::MicButtonHandler for MuteButtonHandler {
             .controller_connected
             .store(false, Ordering::Relaxed);
         broadcast_snapshot(&self.state);
+    }
+
+    fn on_waiting(&mut self, reason: &str) {
+        // Only broadcast when the reason actually changes: this fires on every
+        // reconnect attempt, and the UI does not need a snapshot per attempt.
+        let changed = self
+            .state
+            .controller_error
+            .lock()
+            .map(|current| current.as_deref() != Some(reason))
+            .unwrap_or(false);
+
+        if changed {
+            set_controller_error(&self.state, Some(reason.to_string()));
+            broadcast_snapshot(&self.state);
+        }
+    }
+}
+
+fn set_controller_error(state: &web::Data<ApiState>, error: Option<String>) {
+    if let Ok(mut slot) = state.controller_error.lock() {
+        *slot = error;
     }
 }
 
@@ -519,6 +550,7 @@ fn build_status(state: &web::Data<ApiState>) -> StatusResponse {
         api: state.bound_addr.clone(),
         muted: state.last_muted.lock().ok().and_then(|m| *m),
         controller_connected: state.controller_connected.load(Ordering::Relaxed),
+        controller_error: state.controller_error.lock().ok().and_then(|e| e.clone()),
         listener: current_listener_status(state),
     }
 }
