@@ -23,6 +23,22 @@ const REPORT_STALE_AFTER: Duration = Duration::from_secs(5);
 /// Only repeat the "still waiting for a controller" line every N attempts, so
 /// an unplugged controller doesn't flood the log.
 const WAITING_LOG_EVERY: u32 = 20;
+/// How often to poll Discord for mute/deafen changes made outside the
+/// controller — from the menu bar, or inside Discord itself — so the LED and
+/// lightbar don't drift out of sync with reality.
+const SYNC_POLL_INTERVAL: Duration = Duration::from_secs(2);
+
+// Lightbar colours mirroring voice state. Kept moderate so the bar reads as a
+// clear status light rather than a distraction. Green live, red muted, amber
+// deafened.
+const LIGHTBAR_LIVE: (u8, u8, u8) = (0, 80, 24);
+const LIGHTBAR_MUTED: (u8, u8, u8) = (130, 0, 0);
+const LIGHTBAR_DEAFENED: (u8, u8, u8) = (140, 40, 0);
+
+// Motor amplitudes at full (100%) strength, scaled down by the user's rumble
+// setting. The firmer buzz confirms muting; the lighter one, going live.
+const RUMBLE_STRONG_FULL: u8 = 200;
+const RUMBLE_LIGHT_FULL: u8 = 130;
 
 /// A parsed DualSense battery reading, from the same input reports the mic
 /// button rides in.
@@ -57,14 +73,59 @@ impl ChargeState {
     }
 }
 
+/// How the app's voice state is mirrored onto the controller's mic LED and
+/// lightbar. Deafen outranks mute, since deafening implies muting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VoiceState {
+    Live,
+    Muted,
+    Deafened,
+}
+
+impl VoiceState {
+    /// The mic-mute LED is lit whenever you can't be heard.
+    fn mic_led_on(self) -> bool {
+        !matches!(self, VoiceState::Live)
+    }
+
+    /// Lightbar colour for this state.
+    fn lightbar(self) -> (u8, u8, u8) {
+        match self {
+            VoiceState::Live => LIGHTBAR_LIVE,
+            VoiceState::Muted => LIGHTBAR_MUTED,
+            VoiceState::Deafened => LIGHTBAR_DEAFENED,
+        }
+    }
+}
+
 /// Callbacks the mic-button listener fires as the controller comes and goes.
 pub trait MicButtonHandler {
-    /// The mic button was pressed. Returns the resulting mute state.
-    fn on_press(&mut self) -> Result<bool>;
+    /// The mic button was pressed. Returns the resulting voice state.
+    fn on_press(&mut self) -> Result<VoiceState>;
 
-    /// A controller was (re)connected. Returns the mute state to restore to the
-    /// controller's mic LED, which comes back off after every reconnect.
-    fn on_connected(&mut self) -> Option<bool>;
+    /// A controller was (re)connected. Returns the voice state to restore to the
+    /// controller's mic LED and lightbar, which come back reset after every
+    /// reconnect.
+    fn on_connected(&mut self) -> Option<VoiceState>;
+
+    /// Periodic poll, a couple of times a second's worth apart. Returns
+    /// `Some(state)` when the voice state changed outside the controller (a
+    /// mute from the menu bar or from inside Discord) so the LED and lightbar
+    /// can be re-synced. `None` when nothing changed.
+    fn on_tick(&mut self) -> Option<VoiceState>;
+
+    /// Current rumble confirmation strength, 0–100. Read fresh on each toggle
+    /// so a settings change takes effect without restarting the listener; 0
+    /// means no buzz.
+    fn rumble_strength(&self) -> u8;
+
+    /// Whether the lightbar should mirror the voice state. Read fresh so toggling
+    /// it in settings takes effect live; when off, the lightbar is driven dark.
+    fn lightbar_enabled(&self) -> bool;
+
+    /// Whether a one-off test buzz has been requested (e.g. from the settings
+    /// slider). Consumes the request, so it fires once per ask.
+    fn take_rumble_test(&mut self) -> bool;
 
     /// The controller reported a new battery reading. Fires on the first full
     /// report after a connect and whenever the level or charging state changes.
@@ -125,10 +186,10 @@ pub fn listen_mic_button_until(
         };
         waiting_attempts = 0;
 
-        // The controller's mic LED resets on reconnect, so push the mute state
-        // we believe Discord is in rather than leaving the LED lying.
-        if let Some(muted) = handler.on_connected() {
-            restore_mic_led(&device, &stop, muted);
+        // The controller's mic LED and lightbar reset on reconnect, so push the
+        // voice state we believe Discord is in rather than leaving them lying.
+        if let Some(state) = handler.on_connected() {
+            restore_feedback(&device, &stop, state, handler.lightbar_enabled());
         }
 
         let outcome = run_session(&device, &stop, handler);
@@ -161,6 +222,13 @@ fn run_session(
     let mut output_seq = 0_u8;
     let mut last_report_at = Instant::now();
     let mut last_battery: Option<Battery> = None;
+    let mut last_tick = Instant::now();
+    // What the mic LED and lightbar currently show, so the periodic poll only
+    // rewrites them when the voice state actually moves.
+    let mut last_synced: Option<VoiceState> = None;
+    // Track the lightbar setting so flipping it in settings re-syncs promptly,
+    // rather than waiting for the next voice-state change.
+    let mut last_lightbar = handler.lightbar_enabled();
 
     loop {
         if should_stop(stop) {
@@ -196,6 +264,43 @@ fn run_session(
         if last_report_id != Some(report[0]) {
             last_report_id = Some(report[0]);
             println!("Controller report id changed to 0x{:02x}", report[0]);
+        }
+
+        // Poll Discord for state changed elsewhere (menu bar, or inside Discord)
+        // and re-sync the LED and lightbar when it moved. Done here, where a
+        // fresh report tells us the transport, rather than on a timer thread
+        // that would have to guess USB vs Bluetooth.
+        if last_tick.elapsed() >= SYNC_POLL_INTERVAL {
+            last_tick = Instant::now();
+            if let Some(state) = handler.on_tick()
+                && last_synced != Some(state)
+            {
+                println!("Voice state now {state:?}; syncing controller LED and lightbar.");
+                sync_feedback(device, report[0], state, handler.lightbar_enabled(), &mut output_seq);
+                last_synced = Some(state);
+            }
+        }
+
+        // Honour the lightbar setting being flipped while connected: re-apply
+        // the current state so the bar lights up or goes dark right away.
+        let lightbar = handler.lightbar_enabled();
+        if lightbar != last_lightbar {
+            last_lightbar = lightbar;
+            if let Some(state) = last_synced {
+                sync_feedback(device, report[0], state, lightbar, &mut output_seq);
+            }
+        }
+
+        // A settings-driven test buzz, so the strength slider can be felt while
+        // it's adjusted. Uses the firmer "muted" pattern as the reference.
+        if handler.take_rumble_test() {
+            rumble_confirm(
+                device,
+                report[0],
+                VoiceState::Muted,
+                handler.rumble_strength(),
+                &mut output_seq,
+            );
         }
 
         // The battery byte rides in the same full reports as the mic button.
@@ -236,8 +341,19 @@ fn run_session(
             // A failed toggle must not take the listener down with it — the
             // handler records the error, we log it and keep watching.
             match handler.on_press() {
-                Ok(muted) => {
-                    sync_mic_led(device, report, muted, &mut output_seq);
+                Ok(state) => {
+                    sync_feedback(device, report[0], state, handler.lightbar_enabled(), &mut output_seq);
+                    last_synced = Some(state);
+                    // A short buzz confirms the toggle without needing to look
+                    // at the LED. Only a local button press reaches here, so an
+                    // external mute never makes the controller rumble.
+                    rumble_confirm(
+                        device,
+                        report[0],
+                        state,
+                        handler.rumble_strength(),
+                        &mut output_seq,
+                    );
                     println!("Discord mute toggle finished.");
                 }
                 Err(err) => println!("Discord mute toggle failed, staying alive: {err}"),
@@ -256,10 +372,15 @@ fn run_session(
     }
 }
 
-/// Pushes `muted` to the mic LED right after a (re)connect, before any input
-/// report has arrived to tell us which transport we're on. Reads one report
-/// first, since the LED output format depends on the input report id.
-fn restore_mic_led(device: &HidDevice, stop: &Option<Arc<AtomicBool>>, muted: bool) {
+/// Pushes `state` to the mic LED and lightbar right after a (re)connect, before
+/// any input report has arrived to tell us which transport we're on. Reads one
+/// report first, since the output format depends on the input report id.
+fn restore_feedback(
+    device: &HidDevice,
+    stop: &Option<Arc<AtomicBool>>,
+    state: VoiceState,
+    lightbar: bool,
+) {
     let deadline = Instant::now() + Duration::from_secs(2);
     let mut output_seq = 0_u8;
 
@@ -270,18 +391,18 @@ fn restore_mic_led(device: &HidDevice, stop: &Option<Arc<AtomicBool>>, muted: bo
 
         match read_report(device) {
             Ok(Some((buffer, len))) if mic_button_state(&buffer[..len]).is_some() => {
-                sync_mic_led(device, &buffer[..len], muted, &mut output_seq);
+                sync_feedback(device, buffer[0], state, lightbar, &mut output_seq);
                 return;
             }
             Ok(_) => continue,
             Err(err) => {
-                println!("Warning: could not restore the mic LED after reconnect: {err}");
+                println!("Warning: could not restore controller feedback after reconnect: {err}");
                 return;
             }
         }
     }
 
-    println!("Warning: timed out restoring the mic LED after reconnect.");
+    println!("Warning: timed out restoring controller feedback after reconnect.");
 }
 
 fn should_stop(stop: &Option<Arc<AtomicBool>>) -> bool {
@@ -318,76 +439,191 @@ fn warn_unusable_report(report: &[u8]) {
     }
 }
 
-fn sync_mic_led(device: &HidDevice, input_report: &[u8], muted: bool, output_seq: &mut u8) {
-    match set_mic_mute_led(device, input_report[0], muted, output_seq) {
-        Ok(()) => println!(
-            "Controller mic LED set to {}.",
-            if muted { "on" } else { "off" }
-        ),
-        Err(err) => println!("Warning: could not update controller mic LED: {err}"),
+/// Mirrors `state` onto the controller's mic-mute LED and lightbar in one
+/// output report. With `lightbar` off, the LED still tracks the state but the
+/// lightbar is driven dark rather than left showing a stale colour.
+fn sync_feedback(
+    device: &HidDevice,
+    input_report_id: u8,
+    state: VoiceState,
+    lightbar: bool,
+    output_seq: &mut u8,
+) {
+    let led_on = state.mic_led_on();
+    let rgb = if lightbar { state.lightbar() } else { (0, 0, 0) };
+
+    match write_feedback_report(device, input_report_id, led_on, rgb, output_seq) {
+        Ok(()) => println!("Controller feedback set to {state:?} (lightbar={lightbar})."),
+        Err(err) => println!("Warning: could not update controller feedback: {err}"),
     }
 }
 
-fn set_mic_mute_led(
+fn write_feedback_report(
     device: &HidDevice,
     input_report_id: u8,
-    muted: bool,
+    led_on: bool,
+    rgb: (u8, u8, u8),
     output_seq: &mut u8,
 ) -> Result<()> {
     match input_report_id {
-        0x01 => write_usb_mic_led_report(device, muted),
-        0x31 => write_bluetooth_mic_led_report(device, muted, output_seq),
-        other => bail!("unsupported input report id 0x{other:02x} for mic LED output"),
+        0x01 => write_usb_feedback(device, led_on, rgb),
+        0x31 => write_bluetooth_feedback(device, led_on, rgb, output_seq),
+        other => bail!("unsupported input report id 0x{other:02x} for feedback output"),
     }
 }
 
-fn write_usb_mic_led_report(device: &HidDevice, muted: bool) -> Result<()> {
+fn write_usb_feedback(device: &HidDevice, led_on: bool, rgb: (u8, u8, u8)) -> Result<()> {
     let mut report = [0_u8; 63];
     report[0] = 0x02;
-    report[2] = 0x03;
-    report[9] = u8::from(muted);
-    report[10] = if muted { 0x10 } else { 0x00 };
+    // valid_flag1: mic-mute LED (0x01) + power save (0x02) + lightbar (0x04).
+    report[2] = 0x03 | 0x04;
+
+    report[9] = u8::from(led_on);
+    report[10] = if led_on { 0x10 } else { 0x00 };
+
+    let (r, g, b) = rgb;
+    report[45] = r;
+    report[46] = g;
+    report[47] = b;
 
     let written = device
         .write(&report)
-        .context("failed to write USB DualSense mic LED report")?;
+        .context("failed to write USB DualSense feedback report")?;
     println!(
-        "USB LED output report wrote {written}/{} bytes.",
+        "USB feedback report wrote {written}/{} bytes (led={led_on}, rgb={r},{g},{b}).",
         report.len()
     );
     Ok(())
 }
 
-fn write_bluetooth_mic_led_report(
+fn write_bluetooth_feedback(
     device: &HidDevice,
-    muted: bool,
+    led_on: bool,
+    rgb: (u8, u8, u8),
     output_seq: &mut u8,
 ) -> Result<()> {
     let mut report = [0_u8; 78];
     report[0] = 0x31;
     report[1] = *output_seq << 4;
     report[2] = 0x10;
-    report[4] = 0x03;
-    report[11] = u8::from(muted);
-    report[12] = if muted { 0x10 } else { 0x00 };
+    // valid_flag1: mic-mute LED (0x01) + power save (0x02) + lightbar (0x04).
+    report[4] = 0x03 | 0x04;
+
+    report[11] = u8::from(led_on);
+    report[12] = if led_on { 0x10 } else { 0x00 };
+
+    // The Bluetooth common report is shifted two bytes past the USB one, so the
+    // lightbar bytes land at 47–49 rather than 45–47.
+    let (r, g, b) = rgb;
+    report[47] = r;
+    report[48] = g;
+    report[49] = b;
 
     *output_seq = (*output_seq).wrapping_add(1) & 0x0f;
 
     let crc = dualsense_bluetooth_crc32(&report[..74]);
     report[74..78].copy_from_slice(&crc.to_le_bytes());
 
-    println!(
-        "BT LED report seq=0x{:02x} flag1=0x{:02x} led={} power=0x{:02x} crc=0x{:08x}",
-        report[1], report[4], report[11], report[12], crc
-    );
     let written = device
         .write(&report)
-        .context("failed to write Bluetooth DualSense mic LED report")?;
+        .context("failed to write Bluetooth DualSense feedback report")?;
     println!(
-        "BT LED output report wrote {written}/{} bytes.",
+        "BT feedback report wrote {written}/{} bytes (led={led_on}, rgb={r},{g},{b}).",
         report.len()
     );
     Ok(())
+}
+
+/// A brief tactile confirmation of a *local* toggle: two light taps for going
+/// live, one firmer buzz for muting or deafening. Amplitudes scale with
+/// `strength` (0–100); at 0 the buzz is skipped entirely. Blocks the listen
+/// loop for the length of the pulse, which is fine — a toggle already blocked
+/// on Discord IPC, and the mic button is read again the moment this returns.
+fn rumble_confirm(
+    device: &HidDevice,
+    input_report_id: u8,
+    state: VoiceState,
+    strength: u8,
+    output_seq: &mut u8,
+) {
+    let strength = strength.min(100);
+    if strength == 0 {
+        return;
+    }
+
+    let scale = |full: u8| (u16::from(full) * u16::from(strength) / 100) as u8;
+    let pulse = |left: u8, right: u8, seq: &mut u8| {
+        if let Err(err) = write_rumble_report(device, input_report_id, left, right, seq) {
+            println!("Warning: could not send rumble: {err}");
+        }
+    };
+
+    match state {
+        VoiceState::Live => {
+            let light = scale(RUMBLE_LIGHT_FULL);
+            pulse(0, light, output_seq);
+            thread::sleep(Duration::from_millis(55));
+            pulse(0, 0, output_seq);
+            thread::sleep(Duration::from_millis(45));
+            pulse(0, light, output_seq);
+            thread::sleep(Duration::from_millis(55));
+            pulse(0, 0, output_seq);
+        }
+        VoiceState::Muted | VoiceState::Deafened => {
+            pulse(scale(RUMBLE_STRONG_FULL), 0, output_seq);
+            thread::sleep(Duration::from_millis(150));
+            pulse(0, 0, output_seq);
+        }
+    }
+}
+
+/// Sets the two rumble motors (`left` is the low-frequency/strong motor). Uses
+/// the DS4-compatible vibration path, which the DualSense honours.
+fn write_rumble_report(
+    device: &HidDevice,
+    input_report_id: u8,
+    left: u8,
+    right: u8,
+    output_seq: &mut u8,
+) -> Result<()> {
+    match input_report_id {
+        0x01 => {
+            let mut report = [0_u8; 63];
+            report[0] = 0x02;
+            // valid_flag0: HAPTICS_SELECT (0x02) *and* COMPATIBLE_VIBRATION
+            // (0x01). The DualSense drives rumble through its voice-coil
+            // actuators, so the select bit is required — with only 0x01 the
+            // motors stay silent.
+            report[1] = 0x03;
+            report[3] = right; // motor_right
+            report[4] = left; // motor_left
+            device
+                .write(&report)
+                .context("failed to write USB DualSense rumble report")?;
+            Ok(())
+        }
+        0x31 => {
+            let mut report = [0_u8; 78];
+            report[0] = 0x31;
+            report[1] = *output_seq << 4;
+            report[2] = 0x10;
+            // valid_flag0: HAPTICS_SELECT (0x02) + COMPATIBLE_VIBRATION (0x01).
+            report[3] = 0x03;
+            report[5] = right; // motor_right
+            report[6] = left; // motor_left
+
+            *output_seq = (*output_seq).wrapping_add(1) & 0x0f;
+
+            let crc = dualsense_bluetooth_crc32(&report[..74]);
+            report[74..78].copy_from_slice(&crc.to_le_bytes());
+
+            device
+                .write(&report)
+                .context("failed to write Bluetooth DualSense rumble report")?;
+            Ok(())
+        }
+        other => bail!("unsupported input report id 0x{other:02x} for rumble output"),
+    }
 }
 
 fn dualsense_bluetooth_crc32(report_without_crc: &[u8]) -> u32 {

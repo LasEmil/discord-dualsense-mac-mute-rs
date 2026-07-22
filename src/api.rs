@@ -1,4 +1,4 @@
-use crate::{config, controller, discord_mute, token};
+use crate::{config, controller, discord_ipc::VoiceSettings, discord_mute, token};
 use actix_files::Files;
 use actix_web::{App, HttpRequest, HttpResponse, HttpServer, Responder, dev::ServerHandle, web};
 use anyhow::{Result, anyhow};
@@ -7,7 +7,7 @@ use std::{
     io::Write,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU8, Ordering},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
@@ -40,15 +40,20 @@ pub async fn serve() -> std::io::Result<()> {
     let addr = socket.local_addr()?.to_string();
 
     let (events_tx, _) = broadcast::channel::<String>(32);
+    let preferences = config::load_preferences();
 
     let state = web::Data::new(ApiState {
         started_at: Instant::now(),
         bound_addr: addr.clone(),
         listener: Mutex::new(None),
         last_muted: Mutex::new(None),
+        last_deafened: Mutex::new(None),
         controller_connected: AtomicBool::new(false),
         controller_error: Mutex::new(None),
         controller_battery: Mutex::new(None),
+        rumble_strength: AtomicU8::new(preferences.rumble_strength),
+        rumble_test: AtomicBool::new(false),
+        lightbar_enabled: AtomicBool::new(preferences.lightbar_enabled),
         discord: Mutex::new(None),
         events: events_tx,
         server_handle: Mutex::new(None),
@@ -66,6 +71,19 @@ pub async fn serve() -> std::io::Result<()> {
                 broadcast_snapshot(&state);
             }
         });
+    }
+
+    // Start watching the mic button immediately, so the app is listening from
+    // launch without the user pressing "Start listening" first. Safe before a
+    // controller or Discord is present: the listener waits for the controller
+    // and connects to Discord lazily on the first press.
+    {
+        let state_for_listener = state.clone();
+        if let Err(err) = start_listener(&state, move |stop, finished, last_error| {
+            run_mute_listener(stop, finished, last_error, state_for_listener)
+        }) {
+            println!("Could not auto-start the mic-button listener: {err}");
+        }
     }
 
     // Machine-readable first, for a supervising process reading our stdout.
@@ -88,7 +106,10 @@ pub async fn serve() -> std::io::Result<()> {
             .route("/status", web::get().to(status))
             .route("/config", web::get().to(get_config))
             .route("/config", web::put().to(save_config))
+            .route("/settings", web::put().to(save_settings))
+            .route("/settings/rumble-test", web::post().to(rumble_test))
             .route("/discord/toggle", web::post().to(toggle))
+            .route("/discord/deafen", web::post().to(deafen))
             .route("/listeners/mute", web::post().to(start_mute_listener))
             .route("/listeners/current", web::delete().to(stop_listener))
             .route("/ws", web::get().to(ws_index))
@@ -122,9 +143,12 @@ struct ApiState {
     /// asking for port 0 yields an ephemeral one.
     bound_addr: String,
     listener: Mutex<Option<ListenerWorker>>,
-    /// Last known mute state, updated by both the HTTP toggle endpoint and
-    /// the DualSense button listener, so the UI reflects reality either way.
+    /// Last known mute state, updated by the HTTP toggle endpoint, the
+    /// DualSense button listener, and the periodic Discord sync poll, so the UI
+    /// reflects reality however the change was made.
     last_muted: Mutex<Option<bool>>,
+    /// Last known deafen state, kept alongside mute for the same reasons.
+    last_deafened: Mutex<Option<bool>>,
     /// Whether the running listener currently holds an open controller. A
     /// listener can be running while this is false: it waits for a controller
     /// to appear rather than failing.
@@ -137,6 +161,15 @@ struct ApiState {
     /// controller is attached or it hasn't sent a full report yet. macOS itself
     /// doesn't surface the DualSense battery, so this is the only place it shows.
     controller_battery: Mutex<Option<controller::Battery>>,
+    /// Rumble confirmation strength, 0–100, read live by the listener on each
+    /// buzz so a settings change applies without restarting it.
+    rumble_strength: AtomicU8,
+    /// Set by the settings "test" action; the listener consumes it to fire a
+    /// single buzz at the current strength.
+    rumble_test: AtomicBool,
+    /// Whether the controller lightbar mirrors the mute state, read live by the
+    /// listener so toggling it in settings applies without a restart.
+    lightbar_enabled: AtomicBool,
     /// A single, persistent Discord IPC session reused across toggles.
     /// Reconnecting from scratch on every call races Discord's IPC server
     /// tearing down the previous session, and can hang indefinitely on the
@@ -165,6 +198,7 @@ struct StatusResponse {
     uptime_seconds: u64,
     api: String,
     muted: Option<bool>,
+    deafened: Option<bool>,
     controller_connected: bool,
     controller_error: Option<String>,
     battery: Option<BatteryStatus>,
@@ -203,6 +237,16 @@ struct ConfigStatus {
     configured: bool,
     config_path: String,
     token_path: String,
+    rumble_strength: u8,
+    lightbar_enabled: bool,
+}
+
+/// Partial settings update: any field left out is kept at its current value.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SaveSettingsRequest {
+    rumble_strength: Option<u8>,
+    lightbar_enabled: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -234,13 +278,62 @@ async fn status(state: web::Data<ApiState>) -> impl Responder {
     HttpResponse::Ok().json(build_status(&state))
 }
 
-async fn get_config() -> impl Responder {
+async fn get_config(state: web::Data<ApiState>) -> impl Responder {
     HttpResponse::Ok().json(ConfigStatus {
         ok: true,
         configured: config::load_config().is_ok(),
         config_path: config::config_path().display().to_string(),
         token_path: token::token_path().display().to_string(),
+        rumble_strength: state.rumble_strength.load(Ordering::Relaxed),
+        lightbar_enabled: state.lightbar_enabled.load(Ordering::Relaxed),
     })
+}
+
+async fn save_settings(
+    state: web::Data<ApiState>,
+    request: web::Json<SaveSettingsRequest>,
+) -> impl Responder {
+    // Start from the current values so an omitted field is left untouched.
+    let prefs = config::Preferences {
+        rumble_strength: request
+            .rumble_strength
+            .unwrap_or_else(|| state.rumble_strength.load(Ordering::Relaxed))
+            .min(100),
+        lightbar_enabled: request
+            .lightbar_enabled
+            .unwrap_or_else(|| state.lightbar_enabled.load(Ordering::Relaxed)),
+    };
+
+    // Apply live first so the change is felt immediately, then persist. A failed
+    // write shouldn't stop the running listener from using the new values.
+    state
+        .rumble_strength
+        .store(prefs.rumble_strength, Ordering::Relaxed);
+    state
+        .lightbar_enabled
+        .store(prefs.lightbar_enabled, Ordering::Relaxed);
+
+    match config::save_preferences(&prefs) {
+        Ok(()) => HttpResponse::Ok().json(serde_json::json!({
+            "ok": true,
+            "rumbleStrength": prefs.rumble_strength,
+            "lightbarEnabled": prefs.lightbar_enabled,
+        })),
+        Err(err) => api_error(err),
+    }
+}
+
+async fn rumble_test(state: web::Data<ApiState>) -> impl Responder {
+    if !state.controller_connected.load(Ordering::Relaxed) {
+        return HttpResponse::Ok().json(serde_json::json!({
+            "ok": true,
+            "buzzed": false,
+            "message": "no controller connected",
+        }));
+    }
+
+    state.rumble_test.store(true, Ordering::Relaxed);
+    HttpResponse::Ok().json(serde_json::json!({ "ok": true, "buzzed": true }))
 }
 
 async fn save_config(request: web::Json<SaveConfigRequest>) -> impl Responder {
@@ -259,30 +352,53 @@ async fn save_config(request: web::Json<SaveConfigRequest>) -> impl Responder {
 }
 
 async fn toggle(state: web::Data<ApiState>) -> impl Responder {
-    let state_for_worker = state.clone();
-    let result = web::block(move || -> Result<bool> {
-        let mut guard = state_for_worker
+    match run_discord(&state, discord_mute::DiscordMute::toggle_mute).await {
+        Ok(settings) => {
+            apply_voice(&state, settings);
+            HttpResponse::Ok().json(ToggleResponse {
+                ok: true,
+                muted: settings.mute,
+            })
+        }
+        Err(err) => api_error(err),
+    }
+}
+
+async fn deafen(state: web::Data<ApiState>) -> impl Responder {
+    match run_discord(&state, discord_mute::DiscordMute::toggle_deafen).await {
+        Ok(settings) => {
+            apply_voice(&state, settings);
+            HttpResponse::Ok().json(serde_json::json!({
+                "ok": true,
+                "muted": settings.mute,
+                "deafened": settings.deaf,
+            }))
+        }
+        Err(err) => api_error(err),
+    }
+}
+
+/// Runs a voice-settings action against the shared, persistent Discord session,
+/// connecting it on first use. The action retries once with a fresh reconnect
+/// internally, so this stays resilient without us tearing the connection down
+/// between calls.
+async fn run_discord(
+    state: &web::Data<ApiState>,
+    action: fn(&mut discord_mute::DiscordMute) -> Result<VoiceSettings>,
+) -> Result<VoiceSettings> {
+    let state = state.clone();
+    web::block(move || -> Result<VoiceSettings> {
+        let mut guard = state
             .discord
             .lock()
             .map_err(|_| anyhow!("Discord connection lock is poisoned"))?;
         if guard.is_none() {
             *guard = Some(discord_mute::DiscordMute::connect()?);
         }
-        // `toggle()` already retries once with a fresh reconnect internally
-        // if the current session errors out, so this stays resilient
-        // without us tearing the connection down between calls.
-        guard.as_mut().expect("just ensured Some above").toggle()
+        action(guard.as_mut().expect("just ensured Some above"))
     })
-    .await;
-
-    match result {
-        Ok(Ok(muted)) => {
-            set_muted(&state, muted);
-            HttpResponse::Ok().json(ToggleResponse { ok: true, muted })
-        }
-        Ok(Err(err)) => api_error(err),
-        Err(err) => api_error(anyhow!("Discord toggle worker failed: {err}")),
-    }
+    .await
+    .map_err(|err| anyhow!("Discord worker failed: {err}"))?
 }
 
 async fn stop_listener(state: web::Data<ApiState>) -> impl Responder {
@@ -442,6 +558,7 @@ fn stop_current_listener(state: &web::Data<ApiState>) -> Result<bool> {
     state.controller_connected.store(false, Ordering::Relaxed);
     set_controller_error(state, None);
     set_controller_battery(state, None);
+    state.rumble_test.store(false, Ordering::Relaxed);
 
     Ok(true)
 }
@@ -452,14 +569,15 @@ fn run_mute_listener(
     last_error: Arc<Mutex<Option<String>>>,
     state: web::Data<ApiState>,
 ) {
-    let result = || -> Result<()> {
-        let mut handler = MuteButtonHandler {
-            discord: discord_mute::DiscordMute::connect()?,
-            state: state.clone(),
-            last_error: last_error.clone(),
-        };
-        controller::listen_mic_button_until(Some(stop), &mut handler)
-    }();
+    // No Discord connection up front: the handler opens one lazily on the first
+    // button press, so the listener can start and wait for a controller even
+    // when Discord isn't running yet.
+    let mut handler = MuteButtonHandler {
+        discord: None,
+        state: state.clone(),
+        last_error: last_error.clone(),
+    };
+    let result = controller::listen_mic_button_until(Some(stop), &mut handler);
 
     // The listener no longer dies on a disconnect, so reaching here means it
     // was stopped or hit something genuinely fatal.
@@ -472,7 +590,11 @@ fn run_mute_listener(
 
 /// Bridges the controller listener to Discord and the shared API state.
 struct MuteButtonHandler {
-    discord: discord_mute::DiscordMute,
+    /// Connected lazily on the first button press rather than at listener start.
+    /// That lets the listener auto-start and wait for a controller before
+    /// Discord is even running, and keeps the one-time OAuth flow tied to an
+    /// explicit user action instead of firing at launch.
+    discord: Option<discord_mute::DiscordMute>,
     state: web::Data<ApiState>,
     last_error: Arc<Mutex<Option<String>>>,
 }
@@ -483,19 +605,29 @@ impl MuteButtonHandler {
             *last_error = error;
         }
     }
+
+    /// Returns the Discord session, connecting it if needed.
+    fn discord(&mut self) -> Result<&mut discord_mute::DiscordMute> {
+        if self.discord.is_none() {
+            self.discord = Some(discord_mute::DiscordMute::connect()?);
+        }
+        Ok(self.discord.as_mut().expect("just ensured Some above"))
+    }
 }
 
 impl controller::MicButtonHandler for MuteButtonHandler {
-    fn on_press(&mut self) -> Result<bool> {
-        match self.discord.toggle() {
-            Ok(muted) => {
+    fn on_press(&mut self) -> Result<controller::VoiceState> {
+        match self.discord().and_then(discord_mute::DiscordMute::toggle_mute) {
+            Ok(settings) => {
                 // Clear a stale failure so the UI stops showing an error that
                 // has since resolved itself.
                 self.record_error(None);
-                set_muted(&self.state, muted);
-                Ok(muted)
+                apply_voice(&self.state, settings);
+                Ok(to_voice_state(settings))
             }
             Err(err) => {
+                // Drop a possibly-dead session so the next press reconnects.
+                self.discord = None;
                 self.record_error(Some(err.to_string()));
                 broadcast_snapshot(&self.state);
                 Err(err)
@@ -503,11 +635,47 @@ impl controller::MicButtonHandler for MuteButtonHandler {
         }
     }
 
-    fn on_connected(&mut self) -> Option<bool> {
+    fn on_connected(&mut self) -> Option<controller::VoiceState> {
         self.state.controller_connected.store(true, Ordering::Relaxed);
         set_controller_error(&self.state, None);
         broadcast_snapshot(&self.state);
-        self.state.last_muted.lock().ok().and_then(|muted| *muted)
+        current_voice_state(&self.state)
+    }
+
+    fn on_tick(&mut self) -> Option<controller::VoiceState> {
+        // A read-only poll of an *already-open* session. We never connect here:
+        // the background sync must not be what triggers the one-time OAuth flow,
+        // so it only runs once a button press has established the session.
+        let discord = self.discord.as_mut()?;
+        let settings = match discord.voice_settings() {
+            Ok(settings) => settings,
+            Err(_) => {
+                // Drop a dead session; a later press reconnects and surfaces any
+                // real error there.
+                self.discord = None;
+                return None;
+            }
+        };
+
+        // Reflect a change made outside the controller in the app UI too.
+        if voice_differs(&self.state, settings) {
+            self.record_error(None);
+            apply_voice(&self.state, settings);
+        }
+
+        Some(to_voice_state(settings))
+    }
+
+    fn rumble_strength(&self) -> u8 {
+        self.state.rumble_strength.load(Ordering::Relaxed)
+    }
+
+    fn lightbar_enabled(&self) -> bool {
+        self.state.lightbar_enabled.load(Ordering::Relaxed)
+    }
+
+    fn take_rumble_test(&mut self) -> bool {
+        self.state.rumble_test.swap(false, Ordering::Relaxed)
     }
 
     fn on_battery(&mut self, battery: controller::Battery) {
@@ -575,11 +743,46 @@ fn current_listener_status(state: &web::Data<ApiState>) -> Option<ListenerStatus
         .and_then(|worker| worker.as_ref().map(ListenerWorker::status))
 }
 
-fn set_muted(state: &web::Data<ApiState>, muted: bool) {
+/// Stores the latest mute/deafen state and pushes it to any open UI.
+fn apply_voice(state: &web::Data<ApiState>, settings: VoiceSettings) {
     if let Ok(mut last_muted) = state.last_muted.lock() {
-        *last_muted = Some(muted);
+        *last_muted = Some(settings.mute);
+    }
+    if let Ok(mut last_deafened) = state.last_deafened.lock() {
+        *last_deafened = Some(settings.deaf);
     }
     broadcast_snapshot(state);
+}
+
+/// Whether `settings` differs from what we last stored — the guard that keeps
+/// the sync poll from broadcasting when nothing actually changed.
+fn voice_differs(state: &web::Data<ApiState>, settings: VoiceSettings) -> bool {
+    let muted = state.last_muted.lock().ok().and_then(|m| *m);
+    let deafened = state.last_deafened.lock().ok().and_then(|d| *d);
+    muted != Some(settings.mute) || deafened != Some(settings.deaf)
+}
+
+/// The voice state to restore to the controller on reconnect, from what we last
+/// believed. `None` until we've learned the mute state at least once.
+fn current_voice_state(state: &web::Data<ApiState>) -> Option<controller::VoiceState> {
+    let muted = state.last_muted.lock().ok().and_then(|m| *m)?;
+    let deafened = state.last_deafened.lock().ok().and_then(|d| *d).unwrap_or(false);
+    Some(to_voice_state(VoiceSettings {
+        mute: muted,
+        deaf: deafened,
+    }))
+}
+
+/// Maps Discord's mute/deafen flags onto the controller's display state, with
+/// deafen taking precedence since it implies mute.
+fn to_voice_state(settings: VoiceSettings) -> controller::VoiceState {
+    if settings.deaf {
+        controller::VoiceState::Deafened
+    } else if settings.mute {
+        controller::VoiceState::Muted
+    } else {
+        controller::VoiceState::Live
+    }
 }
 
 fn build_status(state: &web::Data<ApiState>) -> StatusResponse {
@@ -589,6 +792,7 @@ fn build_status(state: &web::Data<ApiState>) -> StatusResponse {
         uptime_seconds: state.started_at.elapsed().as_secs(),
         api: state.bound_addr.clone(),
         muted: state.last_muted.lock().ok().and_then(|m| *m),
+        deafened: state.last_deafened.lock().ok().and_then(|d| *d),
         controller_connected: state.controller_connected.load(Ordering::Relaxed),
         controller_error: state.controller_error.lock().ok().and_then(|e| e.clone()),
         battery: state

@@ -12,11 +12,14 @@ struct SettingsView: View {
     @State private var saveError: String?
     @State private var didSave = false
     @State private var isSaving = false
+    @State private var rumbleStrength: Double = 100
+    @State private var lightbarEnabled = true
 
     var body: some View {
         Form {
             discordSection
             generalSection
+            controllerSection
             serverSection
         }
         .formStyle(.grouped)
@@ -104,6 +107,61 @@ struct SettingsView: View {
         }
     }
 
+    // MARK: Controller
+
+    private var controllerSection: some View {
+        Section {
+            Toggle(
+                "Mirror mute on the lightbar",
+                isOn: Binding(
+                    get: { lightbarEnabled },
+                    set: { enabled in
+                        lightbarEnabled = enabled
+                        Task { try? await model.client.saveLightbarEnabled(enabled) }
+                    }
+                )
+            )
+
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text("Rumble strength")
+                    Spacer()
+                    Text(rumbleStrength < 1 ? "Off" : "\(Int(rumbleStrength))%")
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+
+                HStack(spacing: 12) {
+                    Slider(value: $rumbleStrength, in: 0...100, step: 5) { editing in
+                        if !editing {
+                            Task { try? await model.client.saveRumbleStrength(Int(rumbleStrength)) }
+                        }
+                    }
+
+                    Button("Test") {
+                        Task {
+                            // Save first so the buzz reflects the slider even
+                            // before the drag-end write lands.
+                            try? await model.client.saveRumbleStrength(Int(rumbleStrength))
+                            try? await model.client.testRumble()
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(!model.controllerConnected || rumbleStrength < 1)
+                }
+            }
+        } header: {
+            Text("Controller")
+        } footer: {
+            Text(
+                "How strong the buzz is when you mute or unmute from the controller. "
+                    + "Test needs the controller connected."
+            )
+            .font(.caption)
+            .foregroundStyle(.secondary)
+        }
+    }
+
     // MARK: Server
 
     private var serverSection: some View {
@@ -133,6 +191,10 @@ struct SettingsView: View {
 
     private func loadConfig() async {
         config = try? await model.client.fetchConfig()
+        if let config {
+            rumbleStrength = Double(config.rumbleStrength)
+            lightbarEnabled = config.lightbarEnabled
+        }
     }
 
     private func save() async {

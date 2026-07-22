@@ -13,6 +13,8 @@ struct PanelView: View {
             VStack(spacing: 14) {
                 MuteControl(model: model)
 
+                DeafenButton(model: model)
+
                 StatusRows(model: model)
 
                 ListenerButton(model: model)
@@ -57,6 +59,13 @@ struct PanelView: View {
 private struct MuteControl: View {
     @ObservedObject var model: AppModel
 
+    /// Red for a plain mute, amber for deafened (matching the lightbar), none
+    /// when live.
+    private var muteTint: Color? {
+        if model.isDeafened { return .orange.opacity(0.5) }
+        return model.isMuted ? .red.opacity(0.5) : nil
+    }
+
     var body: some View {
         Button(action: model.toggleMute) {
             VStack(spacing: 8) {
@@ -84,15 +93,36 @@ private struct MuteControl: View {
         // unlike the menu bar glyph, which has to stay monochrome.
         .glassEffect(
             .regular
-                .tint(model.isMuted ? .red.opacity(0.5) : nil)
+                .tint(muteTint)
                 .interactive(),
             in: .rect(cornerRadius: 20)
         )
         .animation(.smooth(duration: 0.25), value: model.isMuted)
+        .animation(.smooth(duration: 0.25), value: model.isDeafened)
 
         Text(model.muteHint)
             .font(.caption2)
             .foregroundStyle(.tertiary)
+    }
+}
+
+// MARK: - Deafen
+
+private struct DeafenButton: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        Button(action: model.toggleDeafen) {
+            Label(
+                model.deafenLabel,
+                systemImage: model.isDeafened ? "headphones.circle.fill" : "headphones"
+            )
+            .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.glass)
+        .controlSize(.large)
+        .tint(model.isDeafened ? .orange : nil)
+        .disabled(!model.isLive || model.isBusy)
     }
 }
 

@@ -20,10 +20,11 @@ final class AppModel: ObservableObject {
     private var cancellables = Set<AnyCancellable>()
     private var didStart = false
 
-    /// Last mute state we notified about, so we banner transitions rather than
-    /// the steady stream of identical snapshots. `nil` until the first snapshot
-    /// establishes a baseline — the initial state is not a transition.
+    /// Last mute/deafen state we notified about, so we banner transitions rather
+    /// than the steady stream of identical snapshots. `nil` until the first
+    /// snapshot establishes a baseline — the initial state is not a transition.
     private var lastMuted: Bool?
+    private var lastDeafened: Bool?
     /// Whether we've already warned about the current low-battery episode, so a
     /// controller sitting at 5% doesn't fire on every snapshot. Re-arms once it
     /// charges or is unplugged.
@@ -55,20 +56,34 @@ final class AppModel: ObservableObject {
     // MARK: Notifications
 
     private func react(to snapshot: StatusSnapshot) {
-        reactToMute(snapshot)
+        reactToVoice(snapshot)
         reactToBattery(snapshot)
     }
 
-    private func reactToMute(_ snapshot: StatusSnapshot) {
-        guard let muted = snapshot.muted else { return }
-        defer { lastMuted = muted }
+    private func reactToVoice(_ snapshot: StatusSnapshot) {
+        defer {
+            if let muted = snapshot.muted { lastMuted = muted }
+            if let deafened = snapshot.deafened { lastDeafened = deafened }
+        }
 
-        guard let previous = lastMuted, previous != muted else { return }
-        notifier.post(
-            id: "mute-toggle",
-            title: "Discord",
-            body: muted ? "Microphone muted" : "Microphone unmuted"
-        )
+        // Deafen takes priority: Discord couples the two, so deafening also
+        // mutes — reporting both would fire two banners for one action.
+        if let deafened = snapshot.deafened, let previous = lastDeafened, previous != deafened {
+            notifier.post(
+                id: "deafen-toggle",
+                title: "Discord",
+                body: deafened ? "Deafened" : "Undeafened"
+            )
+            return
+        }
+
+        if let muted = snapshot.muted, let previous = lastMuted, previous != muted {
+            notifier.post(
+                id: "mute-toggle",
+                title: "Discord",
+                body: muted ? "Microphone muted" : "Microphone unmuted"
+            )
+        }
     }
 
     private func reactToBattery(_ snapshot: StatusSnapshot) {
@@ -98,6 +113,7 @@ final class AppModel: ObservableObject {
 
     var status: StatusSnapshot? { client.status }
     var isMuted: Bool { status?.muted ?? false }
+    var isDeafened: Bool { status?.deafened ?? false }
     var muteStateKnown: Bool { status?.muted != nil }
     var listenerRunning: Bool { status?.listener?.running ?? false }
     var controllerConnected: Bool { status?.controllerConnected ?? false }
@@ -199,13 +215,18 @@ final class AppModel: ObservableObject {
     var muteHeadline: String {
         guard isLive else { return "Not connected" }
         guard muteStateKnown else { return "Unknown" }
+        if isDeafened { return "Deafened" }
         return isMuted ? "Muted" : "Live"
     }
 
     var muteHint: String {
         guard isLive else { return "waiting for the server" }
+        if isDeafened { return "deafened — tap to unmute" }
         return isMuted ? "tap to unmute" : "tap to mute"
     }
+
+    /// Label for the deafen control, reflecting the current state.
+    var deafenLabel: String { isDeafened ? "Undeafen" : "Deafen" }
 
     // MARK: Lifecycle
 
@@ -253,6 +274,10 @@ final class AppModel: ObservableObject {
 
     func toggleMute() {
         run { try await self.client.toggleMute() }
+    }
+
+    func toggleDeafen() {
+        run { try await self.client.toggleDeafen() }
     }
 
     func toggleListener() {

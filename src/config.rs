@@ -9,6 +9,72 @@ pub struct AppConfig {
     pub client_secret: String,
 }
 
+/// User preferences that aren't Discord credentials. Kept in a separate file so
+/// tuning something like rumble strength never has to touch — or require —
+/// the OAuth secrets.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Preferences {
+    /// Rumble confirmation strength, 0–100. 0 disables the buzz entirely.
+    #[serde(default = "default_rumble_strength")]
+    pub rumble_strength: u8,
+    /// Whether the controller's lightbar mirrors the mute/deafen state. Off
+    /// leaves the lightbar dark so it doesn't fight a game that drives it.
+    #[serde(default = "default_lightbar_enabled")]
+    pub lightbar_enabled: bool,
+}
+
+fn default_rumble_strength() -> u8 {
+    100
+}
+
+fn default_lightbar_enabled() -> bool {
+    true
+}
+
+impl Default for Preferences {
+    fn default() -> Self {
+        Preferences {
+            rumble_strength: default_rumble_strength(),
+            lightbar_enabled: default_lightbar_enabled(),
+        }
+    }
+}
+
+pub fn preferences_path() -> PathBuf {
+    config_dir().join("preferences.json")
+}
+
+/// Loads preferences, falling back to defaults for anything missing or
+/// unreadable — preferences are conveniences, never a reason to fail startup.
+pub fn load_preferences() -> Preferences {
+    match fs::read_to_string(preferences_path()) {
+        Ok(contents) => serde_json::from_str(&contents).unwrap_or_default(),
+        Err(_) => Preferences::default(),
+    }
+}
+
+pub fn save_preferences(prefs: &Preferences) -> Result<()> {
+    let prefs = Preferences {
+        rumble_strength: prefs.rumble_strength.min(100),
+        lightbar_enabled: prefs.lightbar_enabled,
+    };
+    fs::create_dir_all(config_dir()).with_context(|| {
+        format!(
+            "failed to create config directory at {}",
+            config_dir().display()
+        )
+    })?;
+    let contents =
+        serde_json::to_string_pretty(&prefs).context("failed to encode preferences.json")?;
+    fs::write(preferences_path(), format!("{contents}\n")).with_context(|| {
+        format!(
+            "failed to write preferences at {}",
+            preferences_path().display()
+        )
+    })
+}
+
 pub fn load_config() -> Result<AppConfig> {
     let env_client_id = std::env::var("DISCORD_CLIENT_ID").ok();
     let env_client_secret = std::env::var("DISCORD_CLIENT_SECRET").ok();

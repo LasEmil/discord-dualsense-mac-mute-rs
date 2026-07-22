@@ -22,6 +22,7 @@ struct StatusSnapshot: Decodable, Equatable {
     let uptimeSeconds: Int
     let api: String
     let muted: Bool?
+    let deafened: Bool?
     let controllerConnected: Bool
     let controllerError: String?
     let battery: BatteryStatus?
@@ -33,6 +34,8 @@ struct ConfigStatus: Decodable, Equatable {
     let configured: Bool
     let configPath: String
     let tokenPath: String
+    let rumbleStrength: Int
+    let lightbarEnabled: Bool
 }
 
 // MARK: - Client
@@ -125,6 +128,10 @@ final class StatusClient: ObservableObject {
         _ = try await send("/discord/toggle", method: "POST")
     }
 
+    func toggleDeafen() async throws {
+        _ = try await send("/discord/deafen", method: "POST")
+    }
+
     func startListener() async throws {
         _ = try await send("/listeners/mute", method: "POST")
     }
@@ -144,6 +151,20 @@ final class StatusClient: ObservableObject {
             "clientSecret": clientSecret,
         ])
         _ = try await send("/config", method: "PUT", body: body)
+    }
+
+    func saveRumbleStrength(_ value: Int) async throws {
+        let body = try JSONSerialization.data(withJSONObject: ["rumbleStrength": value])
+        _ = try await send("/settings", method: "PUT", body: body)
+    }
+
+    func testRumble() async throws {
+        _ = try await send("/settings/rumble-test", method: "POST")
+    }
+
+    func saveLightbarEnabled(_ enabled: Bool) async throws {
+        let body = try JSONSerialization.data(withJSONObject: ["lightbarEnabled": enabled])
+        _ = try await send("/settings", method: "PUT", body: body)
     }
 
     @discardableResult

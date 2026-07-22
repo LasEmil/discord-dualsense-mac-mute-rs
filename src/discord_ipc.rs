@@ -16,6 +16,13 @@ const OPCODE_CLOSE: i32 = 2;
 const OPCODE_PING: i32 = 3;
 const OPCODE_PONG: i32 = 4;
 
+/// The pieces of Discord's voice settings this app cares about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VoiceSettings {
+    pub mute: bool,
+    pub deaf: bool,
+}
+
 pub struct DiscordIpc {
     stream: UnixStream,
 }
@@ -87,7 +94,10 @@ impl DiscordIpc {
             })
     }
 
-    pub fn toggle_mute(&mut self) -> Result<bool> {
+    /// The self mute/deafen flags Discord currently reports. Deafen is treated
+    /// as optional: not every build includes it, and a missing `deaf` just
+    /// means "not deafened" rather than a broken response.
+    pub fn get_voice_settings(&mut self) -> Result<VoiceSettings> {
         let settings = self.request(json!({
             "cmd": "GET_VOICE_SETTINGS",
             "args": {},
@@ -97,30 +107,38 @@ impl DiscordIpc {
             return Err(discord_error(&settings));
         }
 
-        let currently_muted = settings
-            .get("data")
+        let data = settings.get("data");
+        let mute = data
             .and_then(|data| data.get("mute"))
             .and_then(Value::as_bool)
             .ok_or_else(|| anyhow!("Discord response did not contain data.mute: {settings}"))?;
+        let deaf = data
+            .and_then(|data| data.get("deaf"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
 
-        let mute = !currently_muted;
-        println!(
-            "Discord reports current mute={}, setting mute={}",
-            currently_muted, mute
-        );
+        Ok(VoiceSettings { mute, deaf })
+    }
+
+    pub fn set_mute(&mut self, mute: bool) -> Result<()> {
+        self.set_voice_settings(json!({ "mute": mute }))
+    }
+
+    pub fn set_deaf(&mut self, deaf: bool) -> Result<()> {
+        self.set_voice_settings(json!({ "deaf": deaf }))
+    }
+
+    fn set_voice_settings(&mut self, args: Value) -> Result<()> {
         let response = self.request(json!({
             "cmd": "SET_VOICE_SETTINGS",
-            "args": {
-                "mute": mute,
-            },
+            "args": args,
         }))?;
 
         if response.get("evt").and_then(Value::as_str) == Some("ERROR") {
             return Err(discord_error(&response));
         }
 
-        println!("Discord accepted SET_VOICE_SETTINGS.");
-        Ok(mute)
+        Ok(())
     }
 
     pub fn close(&mut self) -> Result<()> {

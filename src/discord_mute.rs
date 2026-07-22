@@ -1,4 +1,8 @@
-use crate::{auth, config, discord_ipc::DiscordIpc, token};
+use crate::{
+    auth, config,
+    discord_ipc::{DiscordIpc, VoiceSettings},
+    token,
+};
 use anyhow::{Context, Result};
 
 pub struct DiscordMute {
@@ -28,17 +32,55 @@ impl DiscordMute {
         Ok(discord_mute)
     }
 
-    pub fn toggle(&mut self) -> Result<bool> {
-        match self.toggle_with_current_session() {
-            Ok(muted) => Ok(muted),
+    /// Flips self-mute and returns the resulting voice settings.
+    pub fn toggle_mute(&mut self) -> Result<VoiceSettings> {
+        self.with_session("mute toggle", |discord| {
+            let current = discord.get_voice_settings()?;
+            let mute = !current.mute;
+            println!("Discord reports mute={}, setting mute={mute}", current.mute);
+            discord.set_mute(mute)?;
+            Ok(VoiceSettings { mute, ..current })
+        })
+    }
+
+    /// Flips self-deafen and returns the resulting voice settings. Discord
+    /// couples the two — deafening also mutes — so we read the state back rather
+    /// than assume what mute ended up as.
+    pub fn toggle_deafen(&mut self) -> Result<VoiceSettings> {
+        self.with_session("deafen toggle", |discord| {
+            let current = discord.get_voice_settings()?;
+            let deaf = !current.deaf;
+            println!("Discord reports deaf={}, setting deaf={deaf}", current.deaf);
+            discord.set_deaf(deaf)?;
+            discord.get_voice_settings()
+        })
+    }
+
+    /// Reads the current voice settings without changing them — used to keep the
+    /// app and controller in sync with mutes made inside Discord itself.
+    pub fn voice_settings(&mut self) -> Result<VoiceSettings> {
+        self.with_session("voice settings read", |discord| discord.get_voice_settings())
+    }
+
+    /// Runs an IPC exchange, reconnecting and retrying once if the current
+    /// session errors out. A single retry covers Discord tearing down a stale
+    /// session without turning a transient hiccup into a failed action.
+    fn with_session<T>(
+        &mut self,
+        what: &str,
+        exchange: impl Fn(&mut DiscordIpc) -> Result<T>,
+    ) -> Result<T> {
+        match self.run_exchange(&exchange) {
+            Ok(value) => Ok(value),
             Err(first_error) => {
-                println!("Discord toggle failed: {first_error}");
+                println!("Discord {what} failed: {first_error}");
                 println!("Reconnecting Discord IPC and retrying once...");
                 self.discord = None;
                 self.reconnect()
-                    .context("failed to reconnect Discord IPC after toggle failure")?;
-                self.toggle_with_current_session()
-                    .with_context(|| format!("retry after Discord toggle failure also failed; first error was: {first_error}"))
+                    .with_context(|| format!("failed to reconnect Discord IPC after {what}"))?;
+                self.run_exchange(&exchange).with_context(|| {
+                    format!("retry after Discord {what} also failed; first error was: {first_error}")
+                })
             }
         }
     }
@@ -73,17 +115,15 @@ impl DiscordMute {
         Ok(())
     }
 
-    fn toggle_with_current_session(&mut self) -> Result<bool> {
+    fn run_exchange<T>(&mut self, exchange: &impl Fn(&mut DiscordIpc) -> Result<T>) -> Result<T> {
         let discord = self
             .discord
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("Discord IPC session is not connected"))?;
-        let muted = discord.toggle_mute()?;
-
-        // The banner is posted by the macOS app (see `Notifier.swift`), which
-        // reacts to the mute state changing in the status snapshot — that way
-        // it carries the app's own icon, which an `osascript` notification from
+        exchange(discord)
+        // Mute/deafen banners are posted by the macOS app (see `Notifier.swift`),
+        // which reacts to the state changing in the status snapshot — that way
+        // they carry the app's own icon, which an `osascript` notification from
         // here could not.
-        Ok(muted)
     }
 }
