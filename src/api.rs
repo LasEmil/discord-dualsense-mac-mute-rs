@@ -48,6 +48,7 @@ pub async fn serve() -> std::io::Result<()> {
         last_muted: Mutex::new(None),
         controller_connected: AtomicBool::new(false),
         controller_error: Mutex::new(None),
+        controller_battery: Mutex::new(None),
         discord: Mutex::new(None),
         events: events_tx,
         server_handle: Mutex::new(None),
@@ -132,6 +133,10 @@ struct ApiState {
     /// "nothing is plugged in" from "something is, and we are not allowed to
     /// read it" — which otherwise look identical from outside.
     controller_error: Mutex<Option<String>>,
+    /// Last battery reading from the connected controller, or `None` when no
+    /// controller is attached or it hasn't sent a full report yet. macOS itself
+    /// doesn't surface the DualSense battery, so this is the only place it shows.
+    controller_battery: Mutex<Option<controller::Battery>>,
     /// A single, persistent Discord IPC session reused across toggles.
     /// Reconnecting from scratch on every call races Discord's IPC server
     /// tearing down the previous session, and can hang indefinitely on the
@@ -162,7 +167,26 @@ struct StatusResponse {
     muted: Option<bool>,
     controller_connected: bool,
     controller_error: Option<String>,
+    battery: Option<BatteryStatus>,
     listener: Option<ListenerStatus>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct BatteryStatus {
+    /// Charge level 0–100, in the controller's own ~10% steps.
+    percent: u8,
+    /// "discharging" | "charging" | "full" | "unknown".
+    state: &'static str,
+}
+
+impl From<controller::Battery> for BatteryStatus {
+    fn from(battery: controller::Battery) -> Self {
+        BatteryStatus {
+            percent: battery.percent,
+            state: battery.state.label(),
+        }
+    }
 }
 
 #[derive(Serialize, Clone)]
@@ -417,6 +441,7 @@ fn stop_current_listener(state: &web::Data<ApiState>) -> Result<bool> {
     }
     state.controller_connected.store(false, Ordering::Relaxed);
     set_controller_error(state, None);
+    set_controller_battery(state, None);
 
     Ok(true)
 }
@@ -440,6 +465,7 @@ fn run_mute_listener(
     // was stopped or hit something genuinely fatal.
     state.controller_connected.store(false, Ordering::Relaxed);
     set_controller_error(&state, None);
+    set_controller_battery(&state, None);
     finish_listener(result, finished, last_error);
     broadcast_snapshot(&state);
 }
@@ -484,10 +510,18 @@ impl controller::MicButtonHandler for MuteButtonHandler {
         self.state.last_muted.lock().ok().and_then(|muted| *muted)
     }
 
+    fn on_battery(&mut self, battery: controller::Battery) {
+        set_controller_battery(&self.state, Some(battery));
+        broadcast_snapshot(&self.state);
+    }
+
     fn on_disconnected(&mut self) {
         self.state
             .controller_connected
             .store(false, Ordering::Relaxed);
+        // A stale battery reading outlives the controller that reported it, so
+        // clear it rather than leave the UI showing a ghost level.
+        set_controller_battery(&self.state, None);
         broadcast_snapshot(&self.state);
     }
 
@@ -511,6 +545,12 @@ impl controller::MicButtonHandler for MuteButtonHandler {
 fn set_controller_error(state: &web::Data<ApiState>, error: Option<String>) {
     if let Ok(mut slot) = state.controller_error.lock() {
         *slot = error;
+    }
+}
+
+fn set_controller_battery(state: &web::Data<ApiState>, battery: Option<controller::Battery>) {
+    if let Ok(mut slot) = state.controller_battery.lock() {
+        *slot = battery;
     }
 }
 
@@ -551,6 +591,12 @@ fn build_status(state: &web::Data<ApiState>) -> StatusResponse {
         muted: state.last_muted.lock().ok().and_then(|m| *m),
         controller_connected: state.controller_connected.load(Ordering::Relaxed),
         controller_error: state.controller_error.lock().ok().and_then(|e| e.clone()),
+        battery: state
+            .controller_battery
+            .lock()
+            .ok()
+            .and_then(|b| *b)
+            .map(BatteryStatus::from),
         listener: current_listener_status(state),
     }
 }

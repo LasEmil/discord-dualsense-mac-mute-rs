@@ -117,12 +117,41 @@ private struct StatusRows: View {
                     .frame(maxWidth: .infinity, alignment: .leading)
             }
 
+            if model.battery != nil {
+                BatteryRow(model: model)
+            }
+
             StatusRow(
                 title: "Listener",
                 detail: model.listenerRunning ? "Running" : "Stopped",
                 isOn: model.listenerRunning
             )
         }
+    }
+}
+
+/// The DualSense battery, shown only while a controller is attached. macOS
+/// won't tell you this over Bluetooth, so the whole point is to make it
+/// glanceable here: a filling battery glyph, coloured by level, plus the number.
+private struct BatteryRow: View {
+    @ObservedObject var model: AppModel
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Text("Battery")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            Spacer()
+            Image(systemName: model.batterySymbol)
+                .font(.callout)
+                .foregroundStyle(model.batteryColor)
+                .contentTransition(.symbolEffect(.replace))
+                .imageScale(.large)
+            Text(model.batteryDetail)
+                .font(.callout.weight(.medium))
+                .monospacedDigit()
+        }
+        .animation(.smooth(duration: 0.2), value: model.batteryDetail)
     }
 }
 

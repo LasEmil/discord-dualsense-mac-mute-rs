@@ -1,4 +1,4 @@
-use crate::{auth, config, discord_ipc::DiscordIpc, notify, token};
+use crate::{auth, config, discord_ipc::DiscordIpc, token};
 use anyhow::{Context, Result};
 
 pub struct DiscordMute {
@@ -80,11 +80,10 @@ impl DiscordMute {
             .ok_or_else(|| anyhow::anyhow!("Discord IPC session is not connected"))?;
         let muted = discord.toggle_mute()?;
 
-        notify::show(
-            "Discord Mute Toggle",
-            if muted { "Muted" } else { "Unmuted" },
-        );
-
+        // The banner is posted by the macOS app (see `Notifier.swift`), which
+        // reacts to the mute state changing in the status snapshot — that way
+        // it carries the app's own icon, which an `osascript` notification from
+        // here could not.
         Ok(muted)
     }
 }

@@ -8,6 +8,14 @@ struct ListenerStatus: Decodable, Equatable {
     let lastError: String?
 }
 
+/// Mirrors the `battery` object in the server's status snapshot.
+struct BatteryStatus: Decodable, Equatable {
+    /// Charge level 0–100, in the controller's own ~10% steps.
+    let percent: Int
+    /// "discharging" | "charging" | "full" | "unknown".
+    let state: String
+}
+
 /// Mirrors `StatusResponse` in `src/api.rs`.
 struct StatusSnapshot: Decodable, Equatable {
     let pid: Int
@@ -16,6 +24,7 @@ struct StatusSnapshot: Decodable, Equatable {
     let muted: Bool?
     let controllerConnected: Bool
     let controllerError: String?
+    let battery: BatteryStatus?
     let listener: ListenerStatus?
 }
 

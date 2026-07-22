@@ -4,7 +4,6 @@ mod config;
 mod controller;
 mod discord_ipc;
 mod discord_mute;
-mod notify;
 mod token;
 
 #[actix_web::main]

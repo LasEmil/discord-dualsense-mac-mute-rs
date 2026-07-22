@@ -31,6 +31,14 @@ if [ -d "$REPO_DIR/static" ]; then
   cp -R "$REPO_DIR/static" "$APP/Contents/Resources/static"
 fi
 
+# App icon. Committed as a prebuilt .icns; regenerate it with
+# `swift make-icon.swift` from this directory if the artwork changes.
+if [ -f "$MACOS_DIR/AppIcon.icns" ]; then
+  cp "$MACOS_DIR/AppIcon.icns" "$APP/Contents/Resources/AppIcon.icns"
+else
+  echo "warning: AppIcon.icns missing; run 'swift make-icon.swift' to build it" >&2
+fi
+
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -40,6 +48,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleDisplayName</key><string>Discord Mute</string>
   <key>CFBundleIdentifier</key><string>com.emil.discordmute</string>
   <key>CFBundleExecutable</key><string>DiscordMute</string>
+  <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleShortVersionString</key><string>0.1.0</string>
   <key>CFBundleVersion</key><string>1</string>

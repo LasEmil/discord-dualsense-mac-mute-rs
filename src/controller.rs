@@ -24,6 +24,39 @@ const REPORT_STALE_AFTER: Duration = Duration::from_secs(5);
 /// an unplugged controller doesn't flood the log.
 const WAITING_LOG_EVERY: u32 = 20;
 
+/// A parsed DualSense battery reading, from the same input reports the mic
+/// button rides in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Battery {
+    /// Charge level, 0–100. The controller only reports in ~10% steps, so this
+    /// is coarse by nature rather than by rounding.
+    pub percent: u8,
+    pub state: ChargeState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChargeState {
+    Discharging,
+    Charging,
+    /// On the cable and done charging.
+    Full,
+    /// The controller reported a charging error or an out-of-range
+    /// temperature/voltage; the level, if any, is not trustworthy.
+    Unknown,
+}
+
+impl ChargeState {
+    /// The wire/label form used by the API and UI.
+    pub fn label(self) -> &'static str {
+        match self {
+            ChargeState::Discharging => "discharging",
+            ChargeState::Charging => "charging",
+            ChargeState::Full => "full",
+            ChargeState::Unknown => "unknown",
+        }
+    }
+}
+
 /// Callbacks the mic-button listener fires as the controller comes and goes.
 pub trait MicButtonHandler {
     /// The mic button was pressed. Returns the resulting mute state.
@@ -32,6 +65,10 @@ pub trait MicButtonHandler {
     /// A controller was (re)connected. Returns the mute state to restore to the
     /// controller's mic LED, which comes back off after every reconnect.
     fn on_connected(&mut self) -> Option<bool>;
+
+    /// The controller reported a new battery reading. Fires on the first full
+    /// report after a connect and whenever the level or charging state changes.
+    fn on_battery(&mut self, battery: Battery);
 
     /// The controller went away. The listener keeps running and will reconnect.
     fn on_disconnected(&mut self);
@@ -123,6 +160,7 @@ fn run_session(
     let mut last_report_id = None;
     let mut output_seq = 0_u8;
     let mut last_report_at = Instant::now();
+    let mut last_battery: Option<Battery> = None;
 
     loop {
         if should_stop(stop) {
@@ -158,6 +196,21 @@ fn run_session(
         if last_report_id != Some(report[0]) {
             last_report_id = Some(report[0]);
             println!("Controller report id changed to 0x{:02x}", report[0]);
+        }
+
+        // The battery byte rides in the same full reports as the mic button.
+        // Only surface it when it moves: the level steps in ~10% increments, so
+        // this stays quiet rather than firing on every report.
+        if let Some(battery) = battery_state(report)
+            && last_battery != Some(battery)
+        {
+            last_battery = Some(battery);
+            println!(
+                "Controller battery {}% ({})",
+                battery.percent,
+                battery.state.label()
+            );
+            handler.on_battery(battery);
         }
 
         let Some(mic) = mic_button_state(report) else {
@@ -387,6 +440,37 @@ fn mic_button_state(report: &[u8]) -> Option<MicButtonState> {
         }),
         _ => None,
     }
+}
+
+/// Extracts the battery reading from a full input report, or `None` if this
+/// report can't carry it (wrong id, or a Bluetooth simple-mode report too short
+/// to reach the status byte).
+///
+/// The layout mirrors Linux's `hid-playstation` DualSense parser: the `status`
+/// byte sits at offset 52 of the common report, which starts at `data[1]` over
+/// USB (id 0x01) and `data[2]` over Bluetooth (id 0x31) — the same +1/+2 shift
+/// that puts the mic button at byte 10 vs 11. Its low nibble is the charge
+/// level (0–10) and its high nibble is the charging state.
+fn battery_state(report: &[u8]) -> Option<Battery> {
+    let status = match report.first()? {
+        0x01 if report.len() > 53 => report[53],
+        0x31 if report.len() > 54 => report[54],
+        _ => return None,
+    };
+
+    let level = status & 0x0f;
+    // The controller reports 0–10; scale to a percent, biasing up by half a
+    // step so a fresh "10" reads as 100 and a low "1" isn't a misleading 10.
+    let percent = ((u16::from(level) * 10 + 5).min(100)) as u8;
+
+    let (state, percent) = match status >> 4 {
+        0x0 => (ChargeState::Discharging, percent),
+        0x1 => (ChargeState::Charging, percent),
+        0x2 => (ChargeState::Full, 100),
+        _ => (ChargeState::Unknown, percent),
+    };
+
+    Some(Battery { percent, state })
 }
 
 fn open_dualsense(api: &mut HidApi) -> Result<HidDevice> {

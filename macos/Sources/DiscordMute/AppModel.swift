@@ -8,6 +8,7 @@ import SwiftUI
 final class AppModel: ObservableObject {
     let server = ServerProcess()
     let client = StatusClient()
+    let notifier = Notifier()
 
     /// Surfaced under whichever control the user just pressed.
     @Published var actionError: String?
@@ -18,6 +19,15 @@ final class AppModel: ObservableObject {
     private var addressObserver: Task<Void, Never>?
     private var cancellables = Set<AnyCancellable>()
     private var didStart = false
+
+    /// Last mute state we notified about, so we banner transitions rather than
+    /// the steady stream of identical snapshots. `nil` until the first snapshot
+    /// establishes a baseline — the initial state is not a transition.
+    private var lastMuted: Bool?
+    /// Whether we've already warned about the current low-battery episode, so a
+    /// controller sitting at 5% doesn't fire on every snapshot. Re-arms once it
+    /// charges or is unplugged.
+    private var batteryWarned = false
 
     init() {
         // Nested ObservableObjects do not propagate on their own: `@Published`
@@ -30,6 +40,58 @@ final class AppModel: ObservableObject {
                 .sink { [weak self] _ in self?.objectWillChange.send() }
                 .store(in: &cancellables)
         }
+
+        // React to each fresh snapshot for notifications (mute changes, low
+        // battery). Separate from the redraw forwarding above because this
+        // needs the snapshot value, not just the change signal.
+        client.$status
+            .sink { [weak self] snapshot in
+                guard let snapshot else { return }
+                Task { @MainActor in self?.react(to: snapshot) }
+            }
+            .store(in: &cancellables)
+    }
+
+    // MARK: Notifications
+
+    private func react(to snapshot: StatusSnapshot) {
+        reactToMute(snapshot)
+        reactToBattery(snapshot)
+    }
+
+    private func reactToMute(_ snapshot: StatusSnapshot) {
+        guard let muted = snapshot.muted else { return }
+        defer { lastMuted = muted }
+
+        guard let previous = lastMuted, previous != muted else { return }
+        notifier.post(
+            id: "mute-toggle",
+            title: "Discord",
+            body: muted ? "Microphone muted" : "Microphone unmuted"
+        )
+    }
+
+    private func reactToBattery(_ snapshot: StatusSnapshot) {
+        guard snapshot.controllerConnected, let battery = snapshot.battery else {
+            batteryWarned = false
+            return
+        }
+
+        let onCable = battery.state == "charging" || battery.state == "full"
+        let low = !onCable && battery.percent < 10
+
+        if low, !batteryWarned {
+            notifier.post(
+                id: "battery-low",
+                title: "Controller battery low",
+                body: "Your DualSense is at \(battery.percent)%. Time to charge it.",
+                sound: true
+            )
+            batteryWarned = true
+        } else if !low {
+            // Charging or back above the threshold: re-arm for next time.
+            batteryWarned = false
+        }
     }
 
     // MARK: Derived state
@@ -41,6 +103,55 @@ final class AppModel: ObservableObject {
     var controllerConnected: Bool { status?.controllerConnected ?? false }
     var listenerError: String? { status?.listener?.lastError }
     var isLive: Bool { client.isConnected }
+
+    // MARK: Battery
+    //
+    // macOS doesn't surface the DualSense battery over Bluetooth, so this panel
+    // is the only place it shows. Present only while a controller is attached
+    // and has sent a battery reading.
+
+    var battery: BatteryStatus? {
+        controllerConnected ? status?.battery : nil
+    }
+
+    var batteryCharging: Bool {
+        guard let state = battery?.state else { return false }
+        return state == "charging" || state == "full"
+    }
+
+    /// The level line: "Full" while topped off on the cable, otherwise a
+    /// percentage.
+    var batteryDetail: String {
+        guard let battery else { return "—" }
+        if battery.state == "full" { return "Full" }
+        if battery.state == "unknown" { return "\(battery.percent)%?" }
+        return "\(battery.percent)%"
+    }
+
+    /// A battery SF Symbol whose fill tracks the level, with the charging bolt
+    /// when on the cable.
+    var batterySymbol: String {
+        guard let battery else { return "battery.0percent" }
+        if batteryCharging { return "battery.100percent.bolt" }
+        switch battery.percent {
+        case 88...: return "battery.100percent"
+        case 63...: return "battery.75percent"
+        case 38...: return "battery.50percent"
+        case 13...: return "battery.25percent"
+        default: return "battery.0percent"
+        }
+    }
+
+    /// Green normally, warmer as it runs down — but never alarming while it's
+    /// on the cable and filling back up.
+    var batteryColor: Color {
+        guard let battery, !batteryCharging else { return .green }
+        switch battery.percent {
+        case ..<15: return .red
+        case ..<30: return .orange
+        default: return .green
+        }
+    }
 
     /// What the Controller row should say when nothing is attached.
     ///
@@ -101,6 +212,7 @@ final class AppModel: ObservableObject {
     func start() {
         guard !didStart else { return }
         didStart = true
+        notifier.requestAuthorization()
         server.start()
 
         // The port is only known once the server prints it, so wait for the
